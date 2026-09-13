@@ -212,3 +212,38 @@ wait, fetch messages and confirm an assistant reply exists, and read a few secon
 available to you), files committed in git with a clear message (do not push). Finish with a
 short report: files created, test results, integration check output, and any spec item you
 could not implement.
+
+## VERIFIED API FACTS — do NOT re-explore these (already tested by the planner)
+
+- Basic auth works as `-u opencode:<password>`; without it every route returns 401.
+- `GET /experimental/session?roots=true&limit=N&cursor=<number>&search=<s>` returns a plain JSON
+  array (no cursor field, no header). Sessions are sorted newest `time.updated` first. For the next
+  page pass `cursor=<time.updated of the last item>`. If fewer than N items come back, there are no more.
+- `GET /session/{id}/message?directory=D&limit=N` returns the LAST N messages (oldest→newest order);
+  for older pages pass `before=<id of the oldest message you have>`. For the session view, fetch
+  `limit=200` and offer "load older" using `before`.
+- `POST /session/{id}/prompt_async` → 204, returns immediately.
+- `POST /session/{id}/shell?directory=D` body `{"agent":"build","command":"mkdir -p -- '/path'"}` (both required).
+- `DELETE /session/{id}?directory=D` deletes a session.
+- `GET /session/status?directory=D` → `{ "<sessionID>": {"type":"busy"|"idle"|"retry", ...} }` (only non-idle usually listed).
+- `GET /permission?directory=D` → `[{id:"per_…", sessionID, permission, patterns[], metadata}]`;
+  reply `POST /permission/{id}/reply?directory=D` body `{"reply":"once"|"always"|"reject"}`.
+- `GET /question?directory=D` → pending questions `{id:"que_…", sessionID, questions[]}`; the UI may
+  just show them read-only with a Reject button: `POST /question/{id}/reject?directory=D`.
+- `GET /file?path=<relative>&directory=<abs dir>` lists a directory (returns entries with `name`,
+  `path`, `absolute`, `type` "file"|"directory"). Use this for the directory browser (set
+  `directory` to the folder you want to list and `path=.`). Test it ONCE with curl; if it does not
+  behave, fall back to only the datalist suggestions — do not spend more time on it.
+- SSE `GET /global/event`: lines `data: {"directory","project","payload":{"type","properties"}}`.
+  Event types and their `properties`:
+  - `session.created` / `session.updated` / `session.deleted`: `{sessionID, info:<Session>}`
+  - `session.status`: `{sessionID, status:{type}}`; `session.idle`: `{sessionID}`; `session.error`: `{sessionID, error}`
+  - `message.updated`: `{sessionID, info:<Message info>}`; `message.removed`: `{sessionID, messageID}`
+  - `message.part.updated`: `{sessionID, part:<Part with id, messageID, type…>, time}`
+  - `message.part.delta`: `{sessionID, messageID, partID, field:"text", delta}` → append delta to part[field]
+  - `message.part.removed`: `{sessionID, messageID, partID}`
+  - `permission.asked`: `{id, sessionID, permission, patterns, metadata}`; `permission.replied`: `{sessionID, requestID, reply}`
+  - `question.asked`: `{id, sessionID, questions}`; `todo.updated`: `{sessionID, todos}`; `session.diff`: `{sessionID, diff}`
+  - Ignore everything else (`sync`, `session.next.*`, `plugin.added`, `tui.*`, `lsp.*`, `file.*`, `installation.*`, …).
+- Message part shapes: see `samples/messages.json` (read it with `python3 -c` and print only a few parts; it is 160 KB).
+  Tool part: `{type:"tool", tool:"bash", callID, state:{status:"pending"|"running"|"completed"|"error", input, output, error, title, metadata}}`.

@@ -1,0 +1,16 @@
+{
+  "name": "opencode-remote",
+  "version": "1.0.0",
+  "description": "Password-protected, mobile-friendly browser remote control for an opencode serve instance.",
+  "type": "module",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "UNLICENSED"
+}

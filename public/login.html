@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>opencode remote — login</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body data-page="login">
+  <main class="login-wrap">
+    <form id="login-form" class="login-card">
+      <h1>opencode remote</h1>
+      <p class="sub">Enter the access code to continue.</p>
+      <div class="pw-field">
+        <input id="pw" type="text" class="masked" placeholder="Password" aria-label="Password"
+               name="opencode-remote-access-code" autocomplete="off" autocapitalize="off"
+               autocorrect="off" spellcheck="false" data-form-type="other"
+               data-1p-ignore data-lpignore="true" data-bwignore>
+        <button type="button" id="reveal" class="reveal" aria-label="Show password">&#128065;</button>
+      </div>
+      <div id="login-error" class="login-error" hidden></div>
+      <button type="submit" id="login-btn" class="primary btn">Unlock</button>
+    </form>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
