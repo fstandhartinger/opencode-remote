@@ -83,7 +83,7 @@ auth (`OPENCODE_USERNAME` / `OPENCODE_PASSWORD`).
 
 ## Upstream opencode API (verified against opencode 1.18.18 on this host)
 
-Samples of real payloads are in `/home/flori/Dev/opencode-remote-samples/`:
+Samples of real payloads are in `samples/ (inside this repo, gitignored)`:
 `openapi.json` (full spec, 480 KB — grep it, do not read it whole), `key-endpoints.json`,
 `messages.json` (a session with user text, assistant reasoning, a bash tool call, text, step
 parts), `expsessions.json`, `projects.json`, `global-events-sample.txt` (SSE stream).
@@ -197,12 +197,12 @@ session view. Dark, dense, readable, works at 380 px width (Florian uses his pho
 There is a disposable local opencode you may start for testing — do NOT use port 4096:
 
 ```bash
-cd /tmp/ocrc && OPENCODE_SERVER_PASSWORD=devpw timeout 900 opencode serve --hostname 127.0.0.1 --port 4597 &
+cd /home/flori/Dev/opencode-remote/.tmp/ocwork && OPENCODE_SERVER_PASSWORD=devpw timeout 900 opencode serve --hostname 127.0.0.1 --port 4597 &
 cd /home/flori/Dev/opencode-remote && APP_PASSWORD=devapp SESSION_SECRET=x OPENCODE_URL=http://127.0.0.1:4597 OPENCODE_PASSWORD=devpw PORT=8787 node server.js &
 ```
 
 Then with curl: log in, list sessions, list models (verify no secrets), create a session in
-`/tmp/ocrc` with model `chutes/moonshotai/Kimi-K3-TEE` and prompt "reply with the word pong",
+`/home/flori/Dev/opencode-remote/.tmp/ocwork` with model `chutes/moonshotai/Kimi-K3-TEE` and prompt "reply with the word pong",
 wait, fetch messages and confirm an assistant reply exists, and read a few seconds of
 `/api/events`. Kill both processes afterwards. Report what passed.
 
