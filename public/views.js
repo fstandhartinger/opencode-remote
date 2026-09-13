@@ -149,8 +149,10 @@
 
     var meta = A.el('div', 'row-meta');
     if (s.directory) meta.appendChild(A.el('span', 'row-dir', shortDir(s.directory)));
-    if (s.model && s.model.modelID) {
-      meta.appendChild(A.el('span', 'row-model', String(s.model.modelID).split('/').pop()));
+    // Upstream sessions carry model as {id, providerID}, not {modelID}.
+    var rowModel = sessionModelID(s);
+    if (rowModel) {
+      meta.appendChild(A.el('span', 'row-model', String(rowModel).split('/').pop()));
     }
     var cost = A.fmtCost(s.cost);
     if (cost) meta.appendChild(A.el('span', 'row-cost', cost));
@@ -158,11 +160,18 @@
     if (updated) meta.appendChild(A.el('span', 'row-time', updated));
     row.appendChild(meta);
 
-    if (s.summary) {
-      var sum = A.el('div', 'row-summary', String(s.summary).slice(0, 160));
+    // summary is {additions, deletions, files}; only show it when files changed.
+    if (s.summary && s.summary.files) {
+      var sum = A.el('div', 'row-summary',
+        s.summary.files + (s.summary.files === 1 ? ' file' : ' files') +
+        ', +' + (s.summary.additions || 0) + ' −' + (s.summary.deletions || 0));
       row.appendChild(sum);
     }
     return row;
+  }
+
+  function sessionModelID(s) {
+    return s && s.model ? (s.model.id || s.model.modelID || '') : '';
   }
 
   function fetchList(append) {
@@ -450,6 +459,15 @@
     A.loadStatus();
     A.connectEvents(id);
     fetchSession();
+    // The composer's model select needs the model list; the session view can be
+    // opened directly (list click, link), without visiting #/new first.
+    if (!state.models.featured.length && !state.models.more.length) {
+      A.api('/api/models').then(function (m) {
+        state.models = m || { featured: [], more: [] };
+        var sel = document.getElementById('composer-model');
+        if (sel) fillComposerModelSelect(sel);
+      }).catch(function () {});
+    }
   }
 
   function fetchSession() {
@@ -508,7 +526,7 @@
 
     var meta = A.el('div', 'head-meta');
     if (s.directory) meta.appendChild(A.el('span', 'meta-dir', shortDir(s.directory)));
-    if (s.model && s.model.modelID) meta.appendChild(A.el('span', 'meta-model', s.model.providerID + ' / ' + s.model.modelID));
+    if (sessionModelID(s)) meta.appendChild(A.el('span', 'meta-model', s.model.providerID + ' / ' + sessionModelID(s)));
     var cost = A.fmtCost(s.cost);
     if (cost) meta.appendChild(A.el('span', 'meta-cost', cost));
     var updated = A.relTime(s.time && s.time.updated);
@@ -633,13 +651,14 @@
       });
     });
     fillComposerModelSelect(sel);
+    c.appendChild(form);
     return c;
   }
 
   function fillComposerModelSelect(sel) {
     sel.innerHTML = '';
-    var current = (state.session && state.session.model)
-      ? state.session.model.providerID + '/' + state.session.model.modelID : null;
+    var current = sessionModelID(state.session)
+      ? state.session.model.providerID + '/' + sessionModelID(state.session) : null;
     var last = A.getLastModel ? A.getLastModel() : null;
     var groups = ['featured', 'more'];
     groups.forEach(function (gn) {
@@ -655,6 +674,13 @@
       });
       sel.appendChild(og);
     });
+    // Keep the session's own model selectable even when the list filters it out
+    // (e.g. a paid OpenRouter model outside the featured set).
+    if (current && !sel.querySelector('option[value="' + current + '"]')) {
+      var own = A.el('option', null, 'This session’s model — ' + current);
+      own.value = current;
+      sel.insertBefore(own, sel.firstChild);
+    }
     var want = null;
     if (current && sel.querySelector('option[value="' + current + '"]')) want = current;
     else if (last && sel.querySelector('option[value="' + last.providerID + '/' + last.modelID + '"]')) {

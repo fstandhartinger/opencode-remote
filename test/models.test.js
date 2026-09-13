@@ -99,6 +99,23 @@ test('featured only lists models that are actually present', () => {
   assert.equal(f2.length, 1);
 });
 
+test('more only offers free OpenRouter models beyond the featured list', () => {
+  const out = sanitizeModels({
+    openrouter: {
+      id: 'openrouter', name: 'OpenRouter',
+      models: [
+        { id: 'z-ai/glm-5.3-flash', name: 'featured cheap' },
+        { id: 'anthropic/claude-opus-5', name: 'expensive' },
+        { id: 'google/gemma-4-31b-it:free', name: 'free one' },
+      ],
+    },
+    chutes: { id: 'chutes', name: 'Chutes', models: [{ id: 'some/Other-TEE', name: 'chutes other' }] },
+  });
+  const { featured, more } = splitFeatured(out);
+  assert.deepEqual(featured.map((m) => m.modelID), ['z-ai/glm-5.3-flash']);
+  assert.deepEqual(more.map((m) => m.modelID).sort(), ['google/gemma-4-31b-it:free', 'some/Other-TEE']);
+});
+
 // Shape actually returned by GET /config/providers on opencode 1.18.18.
 const REAL_SHAPE = {
   providers: [
