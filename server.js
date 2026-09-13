@@ -213,7 +213,9 @@ function serveStatic(res, urlPath) {
     if (!st.isFile()) return false;
     const ext = path.extname(file);
     const type = STATIC_MIME[ext] || 'application/octet-stream';
-    res.writeHead(200, { 'Content-Type': type, ...SECURITY_HEADERS });
+    // No build step means no hashed filenames: force revalidation so a phone never
+    // keeps running an old views.js against a newer backend after a deploy.
+    res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache', ...SECURITY_HEADERS });
     fs.createReadStream(file).pipe(res);
     return true;
   } catch {
