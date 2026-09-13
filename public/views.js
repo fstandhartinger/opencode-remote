@@ -875,7 +875,9 @@
 
   // ---------- event handling ----------
   function handleEvent(ev) {
-    var payload = ev.payload || {};
+    // The backend forwards a flat {type, properties} envelope (lib/events.js);
+    // accept the raw upstream {payload:{type, properties}} shape too.
+    var payload = (ev && ev.payload) || ev || {};
     var props = payload.properties || {};
     var type = payload.type;
     var sID = props.sessionID ||
