@@ -25,6 +25,10 @@ browser ──HTTPS──> Traefik ──> opencode-remote container (this repo,
 - `lib/events.js` — one upstream `/global/event` SSE connection, whitelisted event
   types fanned out to browsers, filtered per session.
 - `lib/validate.js` — directory and ID validation.
+- `lib/vault.js` — per-chat encryption (scrypt → AES-256-GCM blob format, round-trip digests)
+  and the client for the host-side vault helper.
+- `vault-helper/helper.py` — host-side companion (systemd `opencode-remote-vault.service`,
+  `172.30.1.1:4097`, bearer token): encrypted blob store, `opencode import`, purge of remnants.
 - `public/` — vanilla JS SPA (`app.js`, `views.js`, `markdown.js`, `styles.css`, `theme.js`).
 
 ## UI
@@ -39,6 +43,32 @@ Chat-style layout (sidebar with session history + main pane), modelled on the Ch
 - inline permission and question cards; sticky composer (Enter sends, Shift+Enter newline)
   with a Stop button while the agent runs; delete session; dark/light theme
 
+## Encrypted and private chats
+
+- **Private chat** (checkbox on the new-chat form): the session is created with the title
+  `Private chat · <Berlin date time>`. opencode 1.18 only runs its title generator
+  (`small_model`) while a session still has the default `New session - <ISO>` title
+  (`SessionPrompt.ensureTitle` / `Session.isDefaultTitle`), so the first message never goes
+  to the title model. Compaction uses the chat's own model.
+- **Encrypt** (button in a chat): the app exports the chat through the opencode API (the
+  session, sub-agent child sessions, every message and part, plus referenced truncated
+  tool-output files), encrypts it in the container (scrypt N=2^17 r=8 p=1 → AES-256-GCM,
+  random salt and nonce, versioned 41-byte header as additional data), decrypts it once in
+  memory to prove the blob opens, stores the ciphertext through the helper
+  (`~/.local/share/opencode-remote-vault`, 0600, atomic rename), deletes the session in
+  opencode and asks the helper to purge remnants (leftover event rows, tool-output files,
+  `VACUUM` + `wal_checkpoint(TRUNCATE)`). The sidebar keeps a 🔒 entry with a neutral label.
+- **Decrypt**: checks the stored SHA-256 of the blob (damaged file vs. wrong password),
+  decrypts, re-imports with `opencode import` (plaintext only in a 0700 `/dev/shm` dir),
+  then re-reads the chat through the API and compares per-session message counts and
+  content digests. Re-encrypting replaces the ciphertext of the same entry.
+- The password exists only in request memory: masked text field (not stored by password
+  managers), never logged, never in browser storage. No recovery.
+- **Limits:** this protects the stored history on Sandy. The model provider processed the
+  messages when they were sent; a decrypted chat is plaintext on disk until it is encrypted
+  again; backups made while it was decrypted are not affected; deleted SQLite pages are
+  rebuilt by VACUUM, but SSD/filesystem-level remnants of overwritten blocks are out of reach.
+
 ## Environment
 
 | var | meaning |
@@ -50,6 +80,7 @@ Chat-style layout (sidebar with session history + main pane), modelled on the Ch
 | `DEFAULT_DIRECTORY` | fallback directory for permission/question calls, default `/home/flori/Dev` |
 | `NEW_SESSION_DIRECTORY` | where a new session runs when Directory is left empty, default `/home/flori/Dev/temp` (created on demand) |
 | `ALLOWED_DIR_PREFIX` | new sessions only under this prefix, default `/home/flori/` |
+| `VAULT_URL` / `VAULT_TOKEN` | vault helper (`http://172.30.1.1:4097`, token from `~/.config/opencode-remote-vault.env`); without them Encrypt is hidden |
 | `PORT` | default 8080 |
 
 ## Security notes

@@ -658,6 +658,33 @@ pre.code.diff code { display: block; }
    app.mintapis.com, and browser password managers would cross-fill them) */
 #pw.masked { -webkit-text-security: disc; text-security: disc; letter-spacing: 0.12em; }
 
+/* ---------- encrypted / private chats ---------- */
+.text-input.masked { -webkit-text-security: disc; text-security: disc; letter-spacing: 0.08em; font-size: 16px; }
+.sb-tag { flex-shrink: 0; font-size: 0.68rem; font-weight: 600; padding: 0 6px; border-radius: 999px; border: 1px solid var(--border-2); color: var(--muted); }
+.sb-tag.warn, .status-badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: var(--warn-soft); }
+.lock-row .sb-lock { color: var(--muted); flex-shrink: 0; margin-top: 1px; }
+.lock-row .sb-lock svg { width: 15px; height: 15px; }
+.encrypt-btn { flex-shrink: 0; }
+.encrypt-btn svg, .private-row .icon svg, .modal-title svg, #decrypt-btn svg { width: 15px; height: 15px; }
+.modal-title { display: flex; align-items: center; gap: 6px; }
+.vault-modal { gap: 10px; overflow-y: auto; }
+.vault-modal .modal-text { margin: 0; color: var(--muted); font-size: 0.88rem; line-height: 1.45; }
+.vault-warn { font-size: 0.84rem; font-weight: 600; color: var(--danger); }
+.limits { font-size: 0.8rem; color: var(--muted); }
+.limits summary { cursor: pointer; color: var(--muted); }
+.limits p { margin: 6px 0 0; line-height: 1.45; }
+.private-row { align-items: flex-start; padding: 0 4px; }
+.private-row .icon { color: var(--muted); margin-top: 1px; }
+.private-row strong { color: var(--text); }
+.lock-card { width: 100%; max-width: 420px; margin: auto; display: flex; flex-direction: column; gap: 12px; align-items: stretch; text-align: center; background: var(--bg-raise); border: 1px solid var(--border-2); border-radius: var(--radius-lg); padding: 24px 20px; }
+.lock-badge { align-self: center; width: 56px; height: 56px; border-radius: 50%; display: flex; align-items: center; justify-content: center; background: var(--accent-soft); color: var(--accent); }
+.lock-badge svg { width: 26px; height: 26px; }
+.lock-title { margin: 0; font-size: 1.25rem; font-weight: 650; word-break: break-word; }
+.lock-card .hero-sub { margin: -4px 0 4px; }
+.lock-card .btn.primary { min-height: 44px; font-size: 1rem; }
+.lock-card .limits { text-align: left; }
+.lock-delete { align-self: center; }
+
 /* ---------- animations ---------- */
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes blink { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
@@ -694,4 +721,6 @@ pre.code.diff code { display: block; }
   .dir-pill { max-width: 34%; }
   .chips .chip:nth-child(n+5) { display: none; }
   .card-actions .btn { flex: 1; }
+  .encrypt-btn .btn-label { display: none; }
+  .encrypt-btn { padding: 4px 8px; }
 }

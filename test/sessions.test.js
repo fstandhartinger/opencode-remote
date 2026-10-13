@@ -418,3 +418,27 @@ test('POST /api/questions/:id/reply forwards validated answers', async () => {
   });
   assert.equal(bad.status, 400);
 });
+
+test('POST /api/sessions with private:true presets a neutral title so opencode never generates one', async () => {
+  const cookie = await authed();
+  const origin = `http://127.0.0.1:${appServer.address().port}`;
+  calls.length = 0;
+  const r = await fetch(base + '/api/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', cookie, Origin: origin },
+    body: JSON.stringify({ directory: '/home/flori/Dev/myapp', model: { providerID: 'chutes', modelID: 'x' }, prompt: 'secret', private: true, title: 'ignored' }),
+  });
+  assert.equal(r.status, 200);
+  const create = calls.find((c) => c.method === 'POST' && c.path === '/session');
+  assert.match(create.body.title, /^Private chat · \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+  // opencode's isDefaultTitle() only matches "New session - <ISO>"; ours must never match it.
+  assert.ok(!/^(New session - |Child session - )\d{4}-\d{2}-\d{2}T/.test(create.body.title));
+});
+
+test('vault routes 404 when no vault helper is configured', async () => {
+  const cookie = await authed();
+  const r = await fetch(base + '/api/vault', { headers: { cookie } });
+  assert.equal(r.status, 404);
+  const c = await fetch(base + '/api/config', { headers: { cookie } });
+  assert.equal((await c.json()).vault, false);
+});

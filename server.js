@@ -11,6 +11,7 @@ import { verifyPassword, signToken, verifyToken, LoginRateLimiter, COOKIE_NAME }
 import { validateDirectory, validateExistingDirectory, isValidSessionId, isValidPermissionId, shellQuote } from './lib/validate.js';
 import { sanitizeModels, splitFeatured } from './lib/models.js';
 import { EventHub } from './lib/events.js';
+import { VaultHelper, VaultError, encryptBundle, decryptBundle, validatePassword, digestSession, toolOutputNames, newLockId, sha256 } from './lib/vault.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -31,6 +32,10 @@ const NEW_SESSION_DIRECTORY = process.env.NEW_SESSION_DIRECTORY || '/home/flori/
 // Automated health probes create a session every few minutes under /tmp; they
 // drown out real work in the session list unless hidden.
 const PROBE_DIR_PREFIX = '/tmp/';
+// Host-side vault helper (blob store, opencode import, purge). Encryption is off without it.
+const VAULT_URL = process.env.VAULT_URL || '';
+const VAULT_TOKEN = process.env.VAULT_TOKEN || '';
+const PRIVATE_TITLE_PREFIX = 'Private chat \u00b7 ';
 
 if (!APP_PASSWORD) {
   console.error('APP_PASSWORD is required');
@@ -52,6 +57,7 @@ const upstream = new Upstream({
 });
 const limiter = new LoginRateLimiter();
 const hub = new EventHub(upstream);
+const vault = new VaultHelper({ url: VAULT_URL, token: VAULT_TOKEN });
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -337,7 +343,7 @@ async function handleApi(req, res, url, method) {
 
     // ---- config (non-secret UI defaults) ----
     if (pathname === '/api/config' && method === 'GET') {
-      return json(res, 200, { newSessionDirectory: NEW_SESSION_DIRECTORY, allowedPrefix: ALLOWED_DIR_PREFIX });
+      return json(res, 200, { newSessionDirectory: NEW_SESSION_DIRECTORY, allowedPrefix: ALLOWED_DIR_PREFIX, vault: vault.enabled });
     }
 
     // ---- models ----
@@ -426,6 +432,17 @@ async function handleApi(req, res, url, method) {
       return await apiListDirectory(res, v.dir);
     }
 
+    // ---- vault (encrypted chats) ----
+    if (pathname.startsWith('/api/vault')) {
+      if (!vault.enabled) return sendError(res, 404, 'encryption is not configured');
+      if (pathname === '/api/vault' && method === 'GET') return await apiVaultList(res);
+      if (pathname === '/api/vault/encrypt' && method === 'POST') return await apiVaultEncrypt(res, await parseJsonBody(req));
+      const vm = pathname.match(/^\/api\/vault\/(lk_[a-z0-9]{20})(?:\/(decrypt))?$/);
+      if (vm && vm[2] === 'decrypt' && method === 'POST') return await apiVaultDecrypt(res, vm[1], await parseJsonBody(req));
+      if (vm && !vm[2] && method === 'DELETE') return await apiVaultDelete(res, vm[1]);
+      return sendError(res, 404, 'not found');
+    }
+
     // ---- events (SSE) ----
     if (pathname === '/api/events' && method === 'GET') {
       return apiEvents(req, res, url);
@@ -439,6 +456,10 @@ async function handleApi(req, res, url, method) {
       // on the login page.
       const st = err.status === 401 || err.status === 403 || !err.status ? 502 : err.status;
       return sendError(res, st, shortUpstreamMessage(err));
+    }
+    if (err && err.name === 'VaultError') {
+      const st = { password: 400, corrupt: 422, format: 422, state: 409, verify: 500 }[err.code] || (err.status === 409 ? 409 : 502);
+      return sendError(res, st, err.message, { 'X-Vault-Error': err.code });
     }
     if (err && err.message === 'body too large') return sendError(res, 413, 'body too large');
     if (err && err.message === 'invalid JSON body') return sendError(res, 400, 'invalid JSON');
@@ -611,7 +632,11 @@ async function apiSessionGet(res, id, url) {
 async function apiCreateSession(res, body) {
   const rawDir = body.directory;
   const createDirectory = body.createDirectory === true;
-  const title = typeof body.title === 'string' && body.title ? body.title : undefined;
+  // A private chat gets a preset title: opencode only runs its title generator
+  // (small_model) while a session still has the default "New session - <ISO>" title.
+  const isPrivate = body.private === true;
+  const title = isPrivate ? PRIVATE_TITLE_PREFIX + berlinStamp(new Date())
+    : typeof body.title === 'string' && body.title ? body.title : undefined;
   const prompt = typeof body.prompt === 'string' ? body.prompt : undefined;
   const model = body.model;
 
@@ -668,6 +693,12 @@ async function apiCreateSession(res, body) {
   });
 
   return json(res, 200, { session });
+}
+
+function berlinStamp(d) {
+  const f = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+  const p = Object.fromEntries(f.formatToParts(d).map((x) => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
 
 // Upstream lists an existing directory with 200 and answers 500 for a missing one.
@@ -771,6 +802,158 @@ async function apiListDirectory(res, dir) {
     .filter((p) => validateDirectory(p, ALLOWED_DIR_PREFIX).ok)
     .sort();
   return json(res, 200, { path: dir, directories });
+}
+
+// ---------------------------------------------------------------------------
+// API: vault — encrypt / decrypt a whole chat
+// ---------------------------------------------------------------------------
+// Encrypt: export (session + sub-agent children + tool outputs) → encrypt → verify by
+// decrypting in memory → store ciphertext → delete the session in opencode → purge
+// remnants. Decrypt: verify blob hash → decrypt → `opencode import` → re-export and
+// compare per-session digests. The password lives only in this request's memory.
+const vaultBusy = new Set();
+
+function publicEntry(id, e) {
+  return {
+    id,
+    label: e.label || 'Encrypted chat',
+    state: e.state || 'locked',
+    sessionID: e.sessionID || null,
+    createdAt: e.createdAt || null,
+    updatedAt: e.updatedAt || null,
+    messageCount: e.messageCount || 0,
+    private: !!e.private,
+  };
+}
+
+async function apiVaultList(res) {
+  const idx = await vault.index();
+  const entries = Object.entries(idx).map(([id, e]) => publicEntry(id, e))
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  return json(res, 200, { entries });
+}
+
+async function exportTree(rootId, dir) {
+  const out = [];
+  const seen = new Set();
+  async function walk(id) {
+    if (seen.has(id) || seen.size > 200) return;
+    seen.add(id);
+    const [info, messages] = await Promise.all([
+      upstream.json('/session/' + id + qp({ directory: dir })),
+      upstream.json('/session/' + id + '/message' + qp({ directory: dir })),
+    ]);
+    if (!info || !Array.isArray(messages)) throw new VaultError('helper', 'export failed');
+    out.push({ info, messages });
+    const kids = await upstream.json('/session/' + id + '/children' + qp({ directory: dir }));
+    for (const k of Array.isArray(kids) ? kids : []) if (k && isValidSessionId(k.id)) await walk(k.id);
+  }
+  await walk(rootId);
+  return out;
+}
+
+function sameDigests(a, b) {
+  if (a.length !== b.length) return false;
+  const m = new Map(a.map((d) => [d.id, d]));
+  return b.every((d) => { const x = m.get(d.id); return x && x.messageCount === d.messageCount && x.partCount === d.partCount && x.sha256 === d.sha256; });
+}
+
+async function apiVaultEncrypt(res, body) {
+  const id = body.sessionID;
+  const password = body.password;
+  if (!isValidSessionId(id)) return sendError(res, 400, 'invalid session id');
+  const pwErr = validatePassword(password);
+  if (pwErr) return sendError(res, 400, pwErr);
+  const v = validateExistingDirectory(body.directory || DEFAULT_DIRECTORY);
+  if (!v.ok) return sendError(res, 400, v.error);
+  const label = typeof body.label === 'string' ? body.label.trim().slice(0, 80) : '';
+  if (vaultBusy.has(id)) return sendError(res, 409, 'already in progress');
+  vaultBusy.add(id);
+  try {
+    const statuses = await upstream.json('/session/status' + qp({ directory: v.dir })).catch(() => null);
+    const st = statuses && statuses[id];
+    if (st && st.type && st.type !== 'idle') return sendError(res, 409, 'The agent is still working in this chat. Stop it first.');
+
+    const sessions = await exportTree(id, v.dir);
+    const root = sessions[0].info;
+    if (root.parentID) return sendError(res, 400, 'open the main chat to encrypt it');
+    const toolOutputs = toolOutputNames(sessions);
+    const files = await vault.readToolOutputs(toolOutputs);
+    const digests = sessions.map(digestSession);
+    const now = Date.now();
+    const bundle = { format: 'opencode-remote-vault', v: 1, createdAt: now, root: id, directory: root.directory || v.dir, sessions, files, digests };
+    const blob = await encryptBundle(bundle, password);
+    // Prove the blob opens with this password before anything is deleted.
+    const check = await decryptBundle(blob, password);
+    if (!sameDigests(check.sessions.map(digestSession), digests)) throw new VaultError('verify', 'Encryption self-check failed; nothing was deleted.');
+
+    const idx = await vault.index();
+    let lockId = Object.keys(idx).find((k) => idx[k].sessionID === id);
+    const prev = lockId ? idx[lockId] : null;
+    if (!lockId) lockId = newLockId();
+    const isPrivate = typeof root.title === 'string' && root.title.startsWith(PRIVATE_TITLE_PREFIX);
+    const entryLabel = label || (prev && prev.label) || (isPrivate ? root.title : 'Encrypted chat · ' + berlinStamp(new Date(root.time && root.time.created || now)));
+    const messageCount = digests.reduce((n, d) => n + d.messageCount, 0);
+    // Store first (state stays "unlocked" until the plaintext is really gone).
+    await vault.put(lockId, { label: entryLabel, state: 'unlocked', sessionID: id, createdAt: (prev && prev.createdAt) || now, updatedAt: now, messageCount, private: isPrivate }, blob);
+
+    await upstream.fetch('/session/' + id + qp({ directory: v.dir }), { method: 'DELETE' });
+    try {
+      await upstream.json('/session/' + id + qp({ directory: v.dir }));
+      throw new VaultError('state', 'opencode did not delete the chat; it stays readable.');
+    } catch (err) {
+      if (!(err && err.name === 'UpstreamError' && err.status === 404)) throw err;
+    }
+    const purge = await vault.purge(sessions.map((s) => s.info.id), toolOutputs);
+    const entry = await vault.put(lockId, { state: 'locked', updatedAt: Date.now() });
+    return json(res, 200, { entry: publicEntry(lockId, entry), purged: { toolOutputs: purge.toolOutputsRemoved, walBytes: purge.walBytes } });
+  } finally {
+    vaultBusy.delete(id);
+  }
+}
+
+async function apiVaultDecrypt(res, lockId, body) {
+  if (typeof body.password !== 'string' || !body.password) return sendError(res, 400, 'password required');
+  if (vaultBusy.has(lockId)) return sendError(res, 409, 'already in progress');
+  vaultBusy.add(lockId);
+  try {
+    const idx = await vault.index();
+    const e = idx[lockId];
+    if (!e) return sendError(res, 404, 'not found');
+    if (e.state !== 'locked') return sendError(res, 409, 'this chat is already decrypted');
+    const blob = await vault.getBlob(lockId);
+    if (!e.blobSha256 || sha256(blob) !== e.blobSha256) throw new VaultError('corrupt', 'The encrypted file is damaged (checksum mismatch).');
+    const bundle = await decryptBundle(blob, body.password);
+    if (!bundle || bundle.format !== 'opencode-remote-vault' || !Array.isArray(bundle.sessions) || !bundle.sessions.length) {
+      throw new VaultError('corrupt', 'Decrypted data is not a chat.');
+    }
+    const want = Array.isArray(bundle.digests) ? bundle.digests : bundle.sessions.map(digestSession);
+    if (!sameDigests(bundle.sessions.map(digestSession), want)) throw new VaultError('corrupt', 'Decrypted chat fails its integrity check.');
+
+    const imp = await vault.importSessions(bundle.directory, bundle.sessions, bundle.files || {});
+    const dir = imp.directory;
+    const back = [];
+    for (const s of bundle.sessions) {
+      const [info, messages] = await Promise.all([
+        upstream.json('/session/' + s.info.id + qp({ directory: dir })),
+        upstream.json('/session/' + s.info.id + '/message' + qp({ directory: dir })),
+      ]);
+      back.push({ info, messages });
+    }
+    const got = back.map(digestSession);
+    const counts = got.every((d, i) => d.messageCount === want[i].messageCount && d.partCount === want[i].partCount);
+    const exact = sameDigests(got, want);
+    if (!counts) throw new VaultError('verify', 'Imported chat is incomplete; the encrypted copy is kept unchanged.');
+    const entry = await vault.put(lockId, { state: 'unlocked', sessionID: bundle.root, updatedAt: Date.now() });
+    return json(res, 200, { entry: publicEntry(lockId, entry), sessionID: bundle.root, directory: dir, verified: { messages: got.reduce((n, d) => n + d.messageCount, 0), exact } });
+  } finally {
+    vaultBusy.delete(lockId);
+  }
+}
+
+async function apiVaultDelete(res, lockId) {
+  await vault.remove(lockId);
+  return noContent(res);
 }
 
 // ---------------------------------------------------------------------------

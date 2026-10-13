@@ -1,0 +1,21 @@
+[Unit]
+Description=opencode-remote vault helper (encrypted chats: blob store, import, purge; coolify bridge only)
+After=network-online.target docker.service opencode-remote-serve.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flori
+Group=flori
+WorkingDirectory=/home/flori
+Environment=HOME=/home/flori
+Environment=VAULT_HOST=172.30.1.1
+Environment=VAULT_PORT=4097
+EnvironmentFile=/home/flori/.config/opencode-remote-vault.env
+ExecStart=/usr/bin/python3 -I /home/flori/Dev/opencode-remote/vault-helper/helper.py
+UMask=0077
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

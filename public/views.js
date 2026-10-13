@@ -37,8 +37,14 @@
     loadingOlder: false,
     atBottom: true,
     openParts: {},     // partID -> true for expanded tool/reasoning blocks
-    hadDisconnect: false
+    hadDisconnect: false,
+    // encrypted chats (lock entries from the vault helper)
+    vault: { enabled: false, entries: [] }
   };
+  var PRIVATE_PREFIX = 'Private chat \u00b7 ';
+  var LIMITS_TEXT = 'Encryption protects the stored history on Sandy: while a chat is locked, its messages exist only as ciphertext and nobody can read them without your password. ' +
+    'It does not undo what already happened: the model provider processed every message when it was sent, a decrypted chat is plaintext on disk again until you encrypt it, ' +
+    'and backups taken while it was decrypted keep that plaintext. There is no recovery: if you lose this password, the chat is gone.';
 
   var dom = {};        // shell nodes
   var msgEls = {};     // messageID -> element
@@ -102,6 +108,9 @@
     down: SVG('<path d="M12 5v14M5 12l7 7 7-7"/>'),
     up: SVG('<path d="m18 15-6-6-6 6"/>'),
     chevron: SVG('<path d="m9 18 6-6-6-6"/>'),
+    lock: SVG('<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>'),
+    unlock: SVG('<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/>'),
+    eye: SVG('<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>'),
     dot: '<svg viewBox="0 0 24 24" width="10" height="10"><circle cx="12" cy="12" r="5" fill="currentColor"/></svg>'
   };
 
@@ -169,7 +178,16 @@
   function init(App) {
     A = App;
     buildShell();
-    A.api('/api/config').then(function (c) { if (c) state.config = c; refreshDirHint(); }).catch(function () {});
+    A.api('/api/config').then(function (c) {
+      if (c) state.config = c;
+      refreshDirHint();
+      state.configLoaded = true;
+      if (c && c.vault) {
+        state.vault.enabled = true;
+        loadVault().then(function () { if (state.route === 'lock') lockView(state.lockID); });
+        refreshVaultControls();
+      } else if (state.route === 'lock') lockView(state.lockID);
+    }).catch(function () {});
     loadModels();
     A.api('/api/directories/suggest').then(function (d) {
       state.suggestDirs = (d && d.directories) || [];
@@ -379,8 +397,13 @@
       list.appendChild(btn('btn small', 'Retry', function () { fetchList(false); }));
       return;
     }
+    var locked = lockedEntries();
+    if (locked.length) {
+      list.appendChild(el('div', 'sb-group', 'Encrypted'));
+      locked.forEach(function (e) { list.appendChild(lockRow(e)); });
+    }
     if (!state.sessions.length) {
-      list.appendChild(el('div', 'sb-empty', state.search ? 'No sessions match.' : 'No sessions yet.'));
+      if (!locked.length) list.appendChild(el('div', 'sb-empty', state.search ? 'No sessions match.' : 'No sessions yet.'));
       return;
     }
     var lastBucket = null;
@@ -408,8 +431,11 @@
     ind.title = st === 'running' ? 'Running' : st === 'error' ? 'Last run failed' : 'Idle';
     row.appendChild(ind);
     var body = el('span', 'sb-row-body');
-    body.appendChild(el('span', 'sb-title', s.title || s.slug || 'Untitled session'));
+    var titleLine = el('span', 'sb-title', s.title || s.slug || 'Untitled session');
+    body.appendChild(titleLine);
     var meta = el('span', 'sb-meta');
+    if (unlockedEntryFor(s.id)) meta.appendChild(el('span', 'sb-tag warn', 'decrypted'));
+    else if (isPrivateTitle(s.title)) meta.appendChild(el('span', 'sb-tag', 'private'));
     meta.appendChild(el('span', 'sb-dir', shortDir(s.directory)));
     var t = A.relTime(s.time && s.time.updated);
     if (st === 'running') meta.appendChild(el('span', 'sb-state', 'running'));
@@ -419,6 +445,241 @@
     row.appendChild(body);
     row.addEventListener('click', closeDrawer);
     return row;
+  }
+
+  // ---------- encrypted chats ----------
+  function isPrivateTitle(t) { return typeof t === 'string' && t.indexOf(PRIVATE_PREFIX) === 0; }
+  function lockedEntries() {
+    var q = (state.search || '').toLowerCase();
+    return state.vault.entries.filter(function (e) {
+      return e.state === 'locked' && (!q || String(e.label).toLowerCase().indexOf(q) !== -1);
+    });
+  }
+  function unlockedEntryFor(sessionID) {
+    if (!sessionID) return null;
+    for (var i = 0; i < state.vault.entries.length; i++) {
+      var e = state.vault.entries[i];
+      if (e.state === 'unlocked' && e.sessionID === sessionID) return e;
+    }
+    return null;
+  }
+  function loadVault() {
+    if (!state.vault.enabled) return Promise.resolve();
+    return A.api('/api/vault').then(function (d) {
+      state.vault.entries = (d && d.entries) || [];
+      state.vault.loaded = true;
+      renderList();
+      refreshVaultControls();
+    }).catch(function () {});
+  }
+  function lockRow(e) {
+    var row = el('a', 'sb-row lock-row' + (state.route === 'lock' && state.lockID === e.id ? ' active' : ''));
+    row.href = '#/lock/' + encodeURIComponent(e.id);
+    row.dataset.lock = e.id;
+    row.appendChild(icon('lock', 'sb-lock'));
+    var body = el('span', 'sb-row-body');
+    body.appendChild(el('span', 'sb-title', e.label));
+    var meta = el('span', 'sb-meta');
+    meta.appendChild(el('span', 'sb-dir', e.messageCount + (e.messageCount === 1 ? ' message' : ' messages')));
+    var t = A.relTime(e.updatedAt);
+    if (t) meta.appendChild(el('span', 'sb-time', 'locked ' + t));
+    body.appendChild(meta);
+    row.appendChild(body);
+    row.addEventListener('click', closeDrawer);
+    return row;
+  }
+
+  // Masked plain-text field (not type=password) so no browser password manager offers
+  // to store it; the value never touches localStorage.
+  function secretInput(id, placeholder) {
+    var i = el('input', 'text-input masked');
+    i.id = id;
+    i.type = 'text';
+    i.placeholder = placeholder;
+    i.setAttribute('aria-label', placeholder);
+    i.autocomplete = 'off';
+    i.autocapitalize = 'off';
+    i.spellcheck = false;
+    i.setAttribute('autocorrect', 'off');
+    i.setAttribute('data-form-type', 'other');
+    i.setAttribute('data-1p-ignore', '');
+    i.setAttribute('data-lpignore', 'true');
+    i.setAttribute('data-bwignore', '');
+    return i;
+  }
+  function limitsDetails() {
+    var d = el('details', 'limits');
+    d.appendChild(el('summary', null, 'What encryption does and does not protect'));
+    d.appendChild(el('p', null, LIMITS_TEXT));
+    return d;
+  }
+  function refreshVaultControls() {
+    var b = document.getElementById('encrypt-btn');
+    if (b) b.hidden = !(state.vault.enabled && state.session && !state.session.parentID);
+    if (state.route === 'session') renderHeader();
+  }
+
+  function openEncrypt() {
+    closeModal();
+    var s = state.session || {};
+    var existing = unlockedEntryFor(state.sessionID);
+    var overlay = el('div', 'modal-overlay');
+    var box = el('form', 'modal vault-modal');
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', 'Encrypt this chat');
+    var head = el('div', 'modal-head');
+    var h = el('h3', 'modal-title');
+    h.appendChild(icon('lock'));
+    h.appendChild(document.createTextNode(' Encrypt this chat'));
+    head.appendChild(h);
+    head.appendChild(btn('icon-btn', '', closeModal, 'x'));
+    box.appendChild(head);
+    box.appendChild(el('p', 'modal-text', 'The whole history is encrypted with your password and removed from opencode on Sandy. ' +
+      'It stays in the sidebar as a locked entry; Decrypt brings it back so you can continue.'));
+    var lbl = el('input', 'text-input');
+    lbl.id = 'vault-label';
+    lbl.maxLength = 80;
+    lbl.autocomplete = 'off';
+    lbl.placeholder = existing ? existing.label : (isPrivateTitle(s.title) ? s.title : 'Label (optional; default: Encrypted chat \u00b7 date)');
+    lbl.setAttribute('aria-label', 'Label shown while locked');
+    box.appendChild(el('label', 'field-label', 'Label while locked (optional; the chat title is never shown)'));
+    box.appendChild(lbl);
+    var pw1 = secretInput('vault-pw1', 'Password (at least 8 characters)');
+    var pw2 = secretInput('vault-pw2', 'Repeat password');
+    box.appendChild(pw1);
+    box.appendChild(pw2);
+    box.appendChild(el('div', 'vault-warn', 'If you lose this password the chat is gone. There is no recovery.'));
+    box.appendChild(limitsDetails());
+    var err = el('div', 'form-error');
+    err.hidden = true;
+    box.appendChild(err);
+    var actions = el('div', 'modal-btns');
+    actions.appendChild(btn('btn', 'Cancel', closeModal));
+    var go = el('button', 'btn primary');
+    go.type = 'submit';
+    go.id = 'vault-encrypt-go';
+    go.appendChild(icon('lock'));
+    go.appendChild(el('span', 'btn-label', 'Encrypt'));
+    actions.appendChild(go);
+    box.appendChild(actions);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    pw1.focus();
+    var sid = state.sessionID;
+    var dir = state.directory || s.directory;
+    box.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      err.hidden = true;
+      if (pw1.value.length < 8) return fail('Use at least 8 characters.');
+      if (pw1.value !== pw2.value) return fail('The two passwords do not match.');
+      if (state.busy[sid]) return fail('The agent is still working. Stop it or wait until it is idle.');
+      go.disabled = true;
+      go.querySelector('.btn-label').textContent = 'Encrypting\u2026';
+      var body = { sessionID: sid, directory: dir, password: pw1.value, label: lbl.value.trim() };
+      pw1.value = ''; pw2.value = '';
+      A.api('/api/vault/encrypt', { method: 'POST', body: body }).then(function (r) {
+        body.password = null;
+        closeModal();
+        state.sessions = state.sessions.filter(function (x) { return x.id !== sid; });
+        toast('Chat encrypted and removed from opencode');
+        loadVault().then(function () { window.location.hash = '#/lock/' + encodeURIComponent(r.entry.id); });
+      }).catch(function (e) {
+        body.password = null;
+        go.disabled = false;
+        go.querySelector('.btn-label').textContent = 'Encrypt';
+        fail(e.message || 'Encryption failed. Nothing was deleted.');
+      });
+    });
+    function fail(m) { err.textContent = m; err.hidden = false; }
+  }
+
+  function lockView(id) {
+    resetSession();
+    state.route = 'lock';
+    state.lockID = id;
+    A.connectEvents(null);
+    renderList();
+    var main = dom.main;
+    main.innerHTML = '';
+    var e = null;
+    state.vault.entries.forEach(function (x) { if (x.id === id) e = x; });
+    var titleBox = el('div', 'tb-main');
+    titleBox.appendChild(el('div', 'tb-title', e ? e.label : 'Encrypted chat'));
+    titleBox.appendChild(el('div', 'tb-sub', 'encrypted'));
+    main.appendChild(topbar(titleBox));
+    var wrap = el('div', 'new-wrap');
+    var card = el('form', 'lock-card');
+    card.id = 'lock-form';
+    var badge = el('div', 'lock-badge');
+    badge.appendChild(icon('lock'));
+    card.appendChild(badge);
+    card.appendChild(el('h1', 'lock-title', e ? e.label : 'Encrypted chat'));
+    if (!e) {
+      var known = state.configLoaded && (!state.vault.enabled || state.vault.loaded);
+      card.appendChild(el('p', 'hero-sub', !known ? 'Loading\u2026' : state.vault.enabled ? 'This encrypted chat no longer exists.' : 'Encryption is not available.'));
+      wrap.appendChild(card);
+      main.appendChild(wrap);
+      return;
+    }
+    if (e.state !== 'locked') {
+      card.appendChild(el('p', 'hero-sub', 'This chat is currently decrypted.'));
+      var open = el('a', 'btn primary', 'Open the chat');
+      open.href = '#/s/' + encodeURIComponent(e.sessionID);
+      card.appendChild(open);
+      wrap.appendChild(card);
+      main.appendChild(wrap);
+      return;
+    }
+    card.appendChild(el('p', 'hero-sub', e.messageCount + (e.messageCount === 1 ? ' message' : ' messages') +
+      ' \u00b7 locked ' + (A.relTime(e.updatedAt) || '') + (e.private ? ' \u00b7 private' : '')));
+    var pw = secretInput('lock-pw', 'Password');
+    card.appendChild(pw);
+    var err = el('div', 'form-error');
+    err.id = 'lock-err';
+    err.hidden = true;
+    card.appendChild(err);
+    var go = el('button', 'btn primary block');
+    go.type = 'submit';
+    go.id = 'decrypt-btn';
+    go.appendChild(icon('unlock'));
+    go.appendChild(el('span', 'btn-label', 'Decrypt'));
+    card.appendChild(go);
+    card.appendChild(limitsDetails());
+    var del = btn('btn ghost small', 'Delete encrypted chat', function () {
+      if (!window.confirm('Delete this encrypted chat for good? It cannot be recovered.')) return;
+      A.api('/api/vault/' + encodeURIComponent(id), { method: 'DELETE', body: {} }).then(function () {
+        toast('Encrypted chat deleted');
+        loadVault().then(function () { window.location.hash = '#/new'; });
+      }).catch(function (x) { toast(x.message || 'Delete failed', 'err'); });
+    }, 'trash');
+    del.classList.add('lock-delete');
+    card.appendChild(del);
+    wrap.appendChild(card);
+    main.appendChild(wrap);
+    if (!window.matchMedia('(pointer: coarse)').matches) pw.focus();
+    card.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      if (!pw.value) { pw.focus(); return; }
+      err.hidden = true;
+      go.disabled = true;
+      go.querySelector('.btn-label').textContent = 'Decrypting\u2026';
+      var body = { password: pw.value };
+      pw.value = '';
+      A.api('/api/vault/' + encodeURIComponent(id) + '/decrypt', { method: 'POST', body: body }).then(function (r) {
+        body.password = null;
+        toast('Chat decrypted (' + r.verified.messages + ' messages)');
+        loadVault();
+        fetchList(false);
+        window.location.hash = '#/s/' + encodeURIComponent(r.sessionID) + '?d=' + encodeURIComponent(r.directory);
+      }).catch(function (x) {
+        body.password = null;
+        go.disabled = false;
+        go.querySelector('.btn-label').textContent = 'Decrypt';
+        err.textContent = x.message || 'Decryption failed.';
+        err.hidden = false;
+        pw.focus();
+      });
+    });
   }
 
   function upsertListSession(info) {
@@ -609,6 +870,18 @@
     dirBox.appendChild(createRow);
     center.appendChild(dirBox);
 
+    var privRow = el('label', 'check-row private-row');
+    var priv = el('input');
+    priv.type = 'checkbox';
+    priv.id = 'private-chat';
+    privRow.appendChild(priv);
+    privRow.appendChild(icon('lock'));
+    var privText = el('span');
+    privText.appendChild(el('strong', null, 'Private chat'));
+    privText.appendChild(document.createTextNode(' \u2014 no automatic title: the chat gets a neutral name and the title model never sees it. You can encrypt it any time.'));
+    privRow.appendChild(privText);
+    center.appendChild(privRow);
+
     var err = el('div', 'form-error');
     err.id = 'new-err';
     err.hidden = true;
@@ -618,7 +891,7 @@
     wrap.appendChild(center);
     main.appendChild(wrap);
 
-    function submit() { submitNew(form, ta, dirInput, sel, cb, send, err); }
+    function submit() { submitNew(form, ta, dirInput, sel, cb, send, err, priv); }
     wireComposer(ta, submit);
     form.addEventListener('submit', function (e) { e.preventDefault(); submit(); });
     renderRecentDirs();
@@ -666,7 +939,7 @@
     refreshDirHint();
   }
 
-  function submitNew(form, ta, dirInput, sel, cb, send, errBox) {
+  function submitNew(form, ta, dirInput, sel, cb, send, errBox, priv) {
     var prompt = ta.value.trim();
     var directory = dirInput.value.trim();
     var model = selectedModel(sel);
@@ -677,7 +950,7 @@
     form.dataset.busy = '1';
     send.disabled = true;
     send.classList.add('loading');
-    var body = { directory: directory, prompt: prompt, model: model, createDirectory: cb.checked };
+    var body = { directory: directory, prompt: prompt, model: model, createDirectory: cb.checked, private: !!(priv && priv.checked) };
     A.saveLastModel(model);
     A.api('/api/sessions', { method: 'POST', body: body }).then(function (res) {
       var s = (res && res.session) || res;
@@ -798,10 +1071,18 @@
     titleBox.appendChild(el('div', 'tb-sub', shortDir(dir)));
     var badge = el('span', 'status-badge');
     badge.id = 'status-badge';
+    var priv = el('span', 'status-badge private-badge');
+    priv.id = 'private-badge';
+    priv.hidden = true;
+    var enc = btn('btn small encrypt-btn', 'Encrypt', openEncrypt, 'lock');
+    enc.id = 'encrypt-btn';
+    enc.title = 'Encrypt this chat with a password';
+    enc.setAttribute('aria-label', 'Encrypt this chat');
+    enc.hidden = true;
     var del = btn('icon-btn', '', deleteSession, 'trash');
     del.title = 'Delete session';
     del.setAttribute('aria-label', 'Delete session');
-    var bar = topbar(titleBox, [badge, del]);
+    var bar = topbar(titleBox, [priv, badge, enc, del]);
     bar.id = 'session-topbar';
     main.appendChild(bar);
 
@@ -850,6 +1131,9 @@
       renderComposerState();
     }).catch(function (err) {
       if (state.sessionID !== id) return;
+      // An old link to a chat that has since been encrypted: show its lock screen.
+      var locked = state.vault.entries.filter(function (e) { return e.state === 'locked' && e.sessionID === id; })[0];
+      if (locked && err.status === 404) { window.location.hash = '#/lock/' + encodeURIComponent(locked.id); return; }
       var inner = document.getElementById('tl-inner');
       if (!inner || state.messages.length) return;
       inner.innerHTML = '';
@@ -927,6 +1211,16 @@
     var badge = document.getElementById('status-badge');
     badge.className = 'status-badge ' + st;
     badge.textContent = st === 'running' ? (state.busy[state.sessionID] === 'retry' ? 'Retrying' : 'Running') : st === 'error' ? 'Error' : 'Idle';
+    var pb = document.getElementById('private-badge');
+    if (pb) {
+      var unl = unlockedEntryFor(state.sessionID);
+      pb.hidden = !(unl || isPrivateTitle(s.title));
+      pb.className = 'status-badge private-badge' + (unl ? ' warn' : '');
+      pb.textContent = unl ? '\ud83d\udd13 Decrypted' : '\ud83d\udd12 Private';
+      pb.title = unl ? 'Decrypted from an encrypted chat: plaintext on disk until you encrypt it again' : 'Private chat: no automatic title';
+    }
+    var eb = document.getElementById('encrypt-btn');
+    if (eb) eb.hidden = !(state.vault.enabled && !s.parentID && s.id);
     document.title = (s.title || 'Session') + ' \u2014 opencode remote';
   }
 
@@ -1708,7 +2002,9 @@
     closeDrawer();
     closeModal();
     document.title = 'opencode remote';
-    if (parts[0] === 's' && parts[1]) { sessionView(decodeURIComponent(parts[1]), params.d || ''); return; }
+    if (parts[0] === 's' && parts[1]) { state.lockID = null; sessionView(decodeURIComponent(parts[1]), params.d || ''); return; }
+    if (parts[0] === 'lock' && parts[1]) { lockView(decodeURIComponent(parts[1])); return; }
+    state.lockID = null;
     newView();
   }
 
