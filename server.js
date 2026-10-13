@@ -811,7 +811,12 @@ async function apiListDirectory(res, dir) {
 // decrypting in memory → store ciphertext → delete the session in opencode → purge
 // remnants. Decrypt: verify blob hash → decrypt → `opencode import` → re-export and
 // compare per-session digests. The password lives only in this request's memory.
-const vaultBusy = new Set();
+// One vault operation at a time: keeps encrypt/decrypt of the same chat from
+// interleaving and caps scrypt memory (128 MiB per derivation).
+let vaultBusy = false;
+// The helper's request limit; a chat whose import body would exceed it could be
+// encrypted but never decrypted, so encrypt refuses it up front.
+const MAX_IMPORT_BYTES = 180 * 1024 * 1024;
 
 function publicEntry(id, e) {
   return {
@@ -824,6 +829,16 @@ function publicEntry(id, e) {
     messageCount: e.messageCount || 0,
     private: !!e.private,
   };
+}
+
+async function withVaultLock(res, fn) {
+  if (vaultBusy) return sendError(res, 409, 'Another encrypt or decrypt is running. Try again in a moment.');
+  vaultBusy = true;
+  try {
+    return await fn();
+  } finally {
+    vaultBusy = false;
+  }
 }
 
 async function apiVaultList(res) {
@@ -858,6 +873,38 @@ function sameDigests(a, b) {
   return b.every((d) => { const x = m.get(d.id); return x && x.messageCount === d.messageCount && x.partCount === d.partCount && x.sha256 === d.sha256; });
 }
 
+async function sessionExists(id, dir) {
+  try {
+    await upstream.json('/session/' + id + qp({ directory: dir }));
+    return true;
+  } catch (err) {
+    if (err && err.name === 'UpstreamError' && err.status === 404) return false;
+    throw err;
+  }
+}
+
+// Delete sessions in opencode and purge what is left of them. Returns a short
+// warning when remnants could not be removed (the caller still reports success:
+// the ciphertext is stored and the chat is no longer readable through opencode).
+async function deleteAndPurge(ids, dir, toolOutputs) {
+  for (const id of ids) {
+    await upstream.fetch('/session/' + id + qp({ directory: dir }), { method: 'DELETE' }).catch((err) => {
+      if (!(err && err.name === 'UpstreamError' && err.status === 404)) throw err;
+    });
+  }
+  // opencode's Session.remove swallows errors, so check every session really went.
+  for (const id of ids) {
+    if (await sessionExists(id, dir)) throw new VaultError('state', 'opencode did not delete the chat; it stays readable.');
+  }
+  try {
+    const p = await vault.purge(ids, toolOutputs);
+    return p.clean === false ? (p.reason || 'database cleanup incomplete') : null;
+  } catch (err) {
+    console.error('vault purge failed:', err && err.message);
+    return 'database cleanup failed';
+  }
+}
+
 async function apiVaultEncrypt(res, body) {
   const id = body.sessionID;
   const password = body.password;
@@ -867,9 +914,16 @@ async function apiVaultEncrypt(res, body) {
   const v = validateExistingDirectory(body.directory || DEFAULT_DIRECTORY);
   if (!v.ok) return sendError(res, 400, v.error);
   const label = typeof body.label === 'string' ? body.label.trim().slice(0, 80) : '';
-  if (vaultBusy.has(id)) return sendError(res, 409, 'already in progress');
-  vaultBusy.add(id);
-  try {
+  return withVaultLock(res, async () => {
+    const idx = await vault.index();
+    let lockId = Object.keys(idx).find((k) => idx[k].sessionID === id);
+    const prev = lockId ? idx[lockId] : null;
+    // A locked entry for a chat that is visible again means an earlier decrypt failed
+    // half-way: its blob is the only complete copy and must not be replaced.
+    if (prev && prev.state === 'locked') {
+      return sendError(res, 409, 'A locked encrypted copy of this chat already exists. Open it from the Encrypted list and decrypt it instead.');
+    }
+
     const statuses = await upstream.json('/session/status' + qp({ directory: v.dir })).catch(() => null);
     const st = statuses && statuses[id];
     if (st && st.type && st.type !== 'idle') return sendError(res, 409, 'The agent is still working in this chat. Stop it first.');
@@ -879,6 +933,9 @@ async function apiVaultEncrypt(res, body) {
     if (root.parentID) return sendError(res, 400, 'open the main chat to encrypt it');
     const toolOutputs = toolOutputNames(sessions);
     const files = await vault.readToolOutputs(toolOutputs);
+    if (Buffer.byteLength(JSON.stringify({ sessions, files })) > MAX_IMPORT_BYTES) {
+      return sendError(res, 413, 'This chat is too large to encrypt safely (it could not be restored).');
+    }
     const digests = sessions.map(digestSession);
     const now = Date.now();
     const bundle = { format: 'opencode-remote-vault', v: 1, createdAt: now, root: id, directory: root.directory || v.dir, sessions, files, digests };
@@ -887,40 +944,35 @@ async function apiVaultEncrypt(res, body) {
     const check = await decryptBundle(blob, password);
     if (!sameDigests(check.sessions.map(digestSession), digests)) throw new VaultError('verify', 'Encryption self-check failed; nothing was deleted.');
 
-    const idx = await vault.index();
-    let lockId = Object.keys(idx).find((k) => idx[k].sessionID === id);
-    const prev = lockId ? idx[lockId] : null;
     if (!lockId) lockId = newLockId();
     const isPrivate = typeof root.title === 'string' && root.title.startsWith(PRIVATE_TITLE_PREFIX);
     const entryLabel = label || (prev && prev.label) || (isPrivate ? root.title : 'Encrypted chat · ' + berlinStamp(new Date(root.time && root.time.created || now)));
     const messageCount = digests.reduce((n, d) => n + d.messageCount, 0);
     // Store first (state stays "unlocked" until the plaintext is really gone).
-    await vault.put(lockId, { label: entryLabel, state: 'unlocked', sessionID: id, createdAt: (prev && prev.createdAt) || now, updatedAt: now, messageCount, private: isPrivate }, blob);
+    const stored = await vault.put(lockId, { label: entryLabel, state: 'unlocked', sessionID: id, createdAt: (prev && prev.createdAt) || now, updatedAt: now, messageCount, private: isPrivate }, blob);
+    if (!stored || stored.blobSha256 !== sha256(blob)) throw new VaultError('verify', 'The encrypted copy was not stored intact; nothing was deleted.');
 
-    await upstream.fetch('/session/' + id + qp({ directory: v.dir }), { method: 'DELETE' });
-    try {
-      await upstream.json('/session/' + id + qp({ directory: v.dir }));
-      throw new VaultError('state', 'opencode did not delete the chat; it stays readable.');
-    } catch (err) {
-      if (!(err && err.name === 'UpstreamError' && err.status === 404)) throw err;
-    }
-    const purge = await vault.purge(sessions.map((s) => s.info.id), toolOutputs);
+    // Anything said in the chat since the export (another tab, a queued prompt) would be lost.
+    const again = await exportTree(id, v.dir);
+    if (!sameDigests(again.map(digestSession), digests)) throw new VaultError('state', 'The chat changed while encrypting; nothing was deleted. Try again.');
+
+    const warning = await deleteAndPurge(sessions.map((s) => s.info.id), v.dir, toolOutputs);
     const entry = await vault.put(lockId, { state: 'locked', updatedAt: Date.now() });
-    return json(res, 200, { entry: publicEntry(lockId, entry), purged: { toolOutputs: purge.toolOutputsRemoved, walBytes: purge.walBytes } });
-  } finally {
-    vaultBusy.delete(id);
-  }
+    return json(res, 200, { entry: publicEntry(lockId, entry), warning });
+  });
 }
 
 async function apiVaultDecrypt(res, lockId, body) {
   if (typeof body.password !== 'string' || !body.password) return sendError(res, 400, 'password required');
-  if (vaultBusy.has(lockId)) return sendError(res, 409, 'already in progress');
-  vaultBusy.add(lockId);
-  try {
+  return withVaultLock(res, async () => {
     const idx = await vault.index();
     const e = idx[lockId];
     if (!e) return sendError(res, 404, 'not found');
-    if (e.state !== 'locked') return sendError(res, 409, 'this chat is already decrypted');
+    // "unlocked" whose session no longer exists = an encrypt that failed after the
+    // delete; the stored blob is then the chat, so decrypting it is allowed.
+    if (e.state !== 'locked' && e.sessionID && await sessionExists(e.sessionID, DEFAULT_DIRECTORY)) {
+      return sendError(res, 409, 'this chat is already decrypted');
+    }
     const blob = await vault.getBlob(lockId);
     if (!e.blobSha256 || sha256(blob) !== e.blobSha256) throw new VaultError('corrupt', 'The encrypted file is damaged (checksum mismatch).');
     const bundle = await decryptBundle(blob, body.password);
@@ -930,28 +982,34 @@ async function apiVaultDecrypt(res, lockId, body) {
     const want = Array.isArray(bundle.digests) ? bundle.digests : bundle.sessions.map(digestSession);
     if (!sameDigests(bundle.sessions.map(digestSession), want)) throw new VaultError('corrupt', 'Decrypted chat fails its integrity check.');
 
-    const imp = await vault.importSessions(bundle.directory, bundle.sessions, bundle.files || {});
-    const dir = imp.directory;
-    const back = [];
-    for (const s of bundle.sessions) {
-      const [info, messages] = await Promise.all([
-        upstream.json('/session/' + s.info.id + qp({ directory: dir })),
-        upstream.json('/session/' + s.info.id + '/message' + qp({ directory: dir })),
-      ]);
-      back.push({ info, messages });
+    const ids = bundle.sessions.map((s) => s.info.id);
+    let dir = bundle.directory;
+    try {
+      const imp = await vault.importSessions(bundle.directory, bundle.sessions, bundle.files || {});
+      dir = imp.directory;
+      const back = [];
+      for (const s of bundle.sessions) {
+        const [info, messages] = await Promise.all([
+          upstream.json('/session/' + s.info.id + qp({ directory: dir })),
+          upstream.json('/session/' + s.info.id + '/message' + qp({ directory: dir })),
+        ]);
+        back.push({ info, messages });
+      }
+      const got = back.map(digestSession);
+      const counts = got.every((d, i) => d.messageCount === want[i].messageCount && d.partCount === want[i].partCount);
+      if (!counts) throw new VaultError('verify', 'Imported chat is incomplete; the encrypted copy is kept unchanged.');
+      const entry = await vault.put(lockId, { state: 'unlocked', sessionID: bundle.root, updatedAt: Date.now() });
+      return json(res, 200, { entry: publicEntry(lockId, entry), sessionID: bundle.root, directory: dir, verified: { messages: got.reduce((n, d) => n + d.messageCount, 0), exact: sameDigests(got, want) } });
+    } catch (err) {
+      // Never leave a half-imported plaintext copy next to an entry that says "locked".
+      await deleteAndPurge(ids, dir || DEFAULT_DIRECTORY, []).catch((x) => console.error('vault rollback failed:', x && x.message));
+      throw err;
     }
-    const got = back.map(digestSession);
-    const counts = got.every((d, i) => d.messageCount === want[i].messageCount && d.partCount === want[i].partCount);
-    const exact = sameDigests(got, want);
-    if (!counts) throw new VaultError('verify', 'Imported chat is incomplete; the encrypted copy is kept unchanged.');
-    const entry = await vault.put(lockId, { state: 'unlocked', sessionID: bundle.root, updatedAt: Date.now() });
-    return json(res, 200, { entry: publicEntry(lockId, entry), sessionID: bundle.root, directory: dir, verified: { messages: got.reduce((n, d) => n + d.messageCount, 0), exact } });
-  } finally {
-    vaultBusy.delete(lockId);
-  }
+  });
 }
 
 async function apiVaultDelete(res, lockId) {
+
   await vault.remove(lockId);
   return noContent(res);
 }

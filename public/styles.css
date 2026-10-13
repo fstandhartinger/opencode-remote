@@ -659,7 +659,7 @@ pre.code.diff code { display: block; }
 #pw.masked { -webkit-text-security: disc; text-security: disc; letter-spacing: 0.12em; }
 
 /* ---------- encrypted / private chats ---------- */
-.text-input.masked { -webkit-text-security: disc; text-security: disc; letter-spacing: 0.08em; font-size: 16px; }
+.text-input.secret { font-size: 16px; letter-spacing: 0.06em; }
 .sb-tag { flex-shrink: 0; font-size: 0.68rem; font-weight: 600; padding: 0 6px; border-radius: 999px; border: 1px solid var(--border-2); color: var(--muted); }
 .sb-tag.warn, .status-badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: var(--warn-soft); }
 .lock-row .sb-lock { color: var(--muted); flex-shrink: 0; margin-top: 1px; }

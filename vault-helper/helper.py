@@ -37,7 +37,7 @@ OPENCODE_DATA = os.environ.get('OPENCODE_DATA', os.path.join(HOME, '.local/share
 OPENCODE_BIN = os.environ.get('OPENCODE_BIN', os.path.join(HOME, '.opencode/bin/opencode'))
 ALLOWED_DIR_PREFIX = os.environ.get('ALLOWED_DIR_PREFIX', HOME + '/')
 FALLBACK_DIR = os.environ.get('FALLBACK_DIR', os.path.join(HOME, 'Dev/temp'))
-MAX_BODY = 64 * 1024 * 1024
+MAX_BODY = 200 * 1024 * 1024
 MAX_TOOL_OUTPUT_TOTAL = 32 * 1024 * 1024
 
 LOCK_ID = re.compile(r'^lk_[a-z0-9]{20}$')
@@ -170,16 +170,32 @@ def purge(session_ids, tool_outputs):
         # Freed pages still hold the deleted text: rebuild the file, then fold the WAL
         # back in and truncate it. Both are ordinary SQLite transactions and safe while
         # opencode serve has the database open; they wait (busy_timeout) for writers.
-        conn.execute('VACUUM')
+        # temp_store=MEMORY keeps VACUUM's scratch copy of all chats out of /tmp.
+        report['clean'] = True
+        conn.execute('PRAGMA temp_store = MEMORY')
+        try:
+            conn.execute('VACUUM')
+        except sqlite3.OperationalError as e:
+            report['clean'] = False
+            report['reason'] = 'VACUUM did not run (%s); freed pages may still hold text until the next cleanup' % str(e)[:60]
         report['checkpoint'] = None
-        for _ in range(10):
+        for _ in range(20):
             busy, log, ckpt = conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
             report['checkpoint'] = [busy, log, ckpt]
             if busy == 0:
                 break
             time.sleep(0.5)
+        if report['checkpoint'] and report['checkpoint'][0] != 0:
+            report['clean'] = False
+            report['reason'] = 'the database log could not be truncated (another opencode process was reading); old pages may remain until the next cleanup'
     finally:
         conn.close()
+    # Revert diffs live outside the database (opencode storage/session_diff/<id>.json).
+    for sid in session_ids:
+        try:
+            os.unlink(os.path.join(OPENCODE_DATA, 'storage', 'session_diff', sid + '.json'))
+        except FileNotFoundError:
+            pass
     tdir = os.path.join(OPENCODE_DATA, 'tool-output')
     for name in tool_outputs:
         p = os.path.join(tdir, name)
@@ -295,8 +311,11 @@ class Handler(BaseHTTPRequestHandler):
         return bool(TOKEN) and h.startswith('Bearer ') and hmac.compare_digest(h[7:].encode(), TOKEN.encode())
 
     def body_json(self):
-        n = int(self.headers.get('Content-Length') or 0)
-        if n > MAX_BODY:
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            raise HTTPError(400, 'bad Content-Length')
+        if n < 0 or n > MAX_BODY:
             raise HTTPError(413, 'body too large')
         raw = self.rfile.read(n) if n else b''
         try:

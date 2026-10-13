@@ -52,7 +52,7 @@ test('truncated, foreign and hostile headers are rejected before key derivation'
   await assert.rejects(decryptBundle(Buffer.concat([Buffer.from('NOTVAULT'), blob.subarray(8)]), 'correct horse'), (e) => e.code === 'corrupt');
   const v2 = Buffer.from(blob); v2[8] = 2;
   await assert.rejects(decryptBundle(v2, 'correct horse'), (e) => e.code === 'format');
-  const huge = Buffer.from(blob); huge[10] = 30; // 2^30 scrypt would need 128 GiB
+  const huge = Buffer.from(blob); huge[10] = 20; // capped at 2^18 (2^20 r=16 would need 2 GiB)
   await assert.rejects(decryptBundle(huge, 'correct horse'), (e) => e.code === 'corrupt');
 });
 
@@ -73,6 +73,9 @@ test('digest ignores key order but not content', () => {
 
 test('tool-output names and lock ids', () => {
   assert.deepEqual(toolOutputNames(bundle.sessions), ['tool_11567c6f5001I9H21jBZRrRMur']);
+  // a path that is only mentioned in text belongs to someone else
+  const mention = [{ messages: [{ parts: [{ type: 'text', text: 'see /home/flori/.local/share/opencode/tool-output/tool_AAAAAAAAAAAAAAAA' }] }] }];
+  assert.deepEqual(toolOutputNames(mention), []);
   const id = newLockId();
   assert.match(id, /^lk_[a-z0-9]{20}$/);
   assert.notEqual(id, newLockId());

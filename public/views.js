@@ -44,7 +44,7 @@
   var PRIVATE_PREFIX = 'Private chat \u00b7 ';
   var LIMITS_TEXT = 'Encryption protects the stored history on Sandy: while a chat is locked, its messages exist only as ciphertext and nobody can read them without your password. ' +
     'It does not undo what already happened: the model provider processed every message when it was sent, a decrypted chat is plaintext on disk again until you encrypt it, ' +
-    'and backups taken while it was decrypted keep that plaintext. There is no recovery: if you lose this password, the chat is gone.';
+    'and backups taken while it was decrypted keep that plaintext. Deleted data can also linger at the disk level until it is overwritten. There is no recovery: if you lose this password, the chat is gone.';
 
   var dom = {};        // shell nodes
   var msgEls = {};     // messageID -> element
@@ -489,12 +489,13 @@
     return row;
   }
 
-  // Masked plain-text field (not type=password) so no browser password manager offers
-  // to store it; the value never touches localStorage.
+  // type=password so phone keyboards do not learn it; autocomplete off plus the
+  // password-manager opt-outs so it is not offered for saving. Never in localStorage.
   function secretInput(id, placeholder) {
-    var i = el('input', 'text-input masked');
+    var i = el('input', 'text-input secret');
     i.id = id;
-    i.type = 'text';
+    i.type = 'password';
+    i.name = 'ocr-chat-key-' + Math.random().toString(36).slice(2);
     i.placeholder = placeholder;
     i.setAttribute('aria-label', placeholder);
     i.autocomplete = 'off';
@@ -581,7 +582,7 @@
         body.password = null;
         closeModal();
         state.sessions = state.sessions.filter(function (x) { return x.id !== sid; });
-        toast('Chat encrypted and removed from opencode');
+        toast(r.warning ? 'Chat encrypted. Note: ' + r.warning : 'Chat encrypted and removed from opencode', r.warning ? 'err' : '');
         loadVault().then(function () { window.location.hash = '#/lock/' + encodeURIComponent(r.entry.id); });
       }).catch(function (e) {
         body.password = null;
@@ -622,16 +623,16 @@
       return;
     }
     if (e.state !== 'locked') {
-      card.appendChild(el('p', 'hero-sub', 'This chat is currently decrypted.'));
-      var open = el('a', 'btn primary', 'Open the chat');
+      // Normally the chat is open in opencode; if an encrypt failed half-way it is not,
+      // and the stored copy can still be decrypted (the server checks which case it is).
+      card.appendChild(el('p', 'hero-sub', 'This chat is currently decrypted. If it is missing, decrypt the stored copy below.'));
+      var open = el('a', 'btn', 'Open the chat');
       open.href = '#/s/' + encodeURIComponent(e.sessionID);
       card.appendChild(open);
-      wrap.appendChild(card);
-      main.appendChild(wrap);
-      return;
+    } else {
+      card.appendChild(el('p', 'hero-sub', e.messageCount + (e.messageCount === 1 ? ' message' : ' messages') +
+        ' \u00b7 locked ' + (A.relTime(e.updatedAt) || '') + (e.private ? ' \u00b7 private' : '')));
     }
-    card.appendChild(el('p', 'hero-sub', e.messageCount + (e.messageCount === 1 ? ' message' : ' messages') +
-      ' \u00b7 locked ' + (A.relTime(e.updatedAt) || '') + (e.private ? ' \u00b7 private' : '')));
     var pw = secretInput('lock-pw', 'Password');
     card.appendChild(pw);
     var err = el('div', 'form-error');
@@ -645,8 +646,9 @@
     go.appendChild(el('span', 'btn-label', 'Decrypt'));
     card.appendChild(go);
     card.appendChild(limitsDetails());
-    var del = btn('btn ghost small', 'Delete encrypted chat', function () {
-      if (!window.confirm('Delete this encrypted chat for good? It cannot be recovered.')) return;
+    var del = btn('btn ghost small', 'Delete encrypted copy', function () {
+      if (!window.confirm(e.state === 'locked' ? 'Delete this encrypted chat for good? It cannot be recovered.'
+        : 'Delete the stored encrypted copy? The decrypted chat itself stays in opencode.')) return;
       A.api('/api/vault/' + encodeURIComponent(id), { method: 'DELETE', body: {} }).then(function () {
         toast('Encrypted chat deleted');
         loadVault().then(function () { window.location.hash = '#/new'; });
