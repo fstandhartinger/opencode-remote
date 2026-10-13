@@ -21,6 +21,14 @@ let appServer;
 let base;
 
 const calls = [];
+// Directories the fake upstream reports as existing (others answer /file with 500).
+const MISSING_DIRS = new Set(['/home/flori/Dev/newdir', '/home/flori/Dev/missing-default']);
+const FAKE_SESSIONS = [];
+for (let i = 0; i < 30; i++) {
+  FAKE_SESSIONS.push({ id: 'ses_p' + i, directory: '/tmp/llm-health-opencode-probe', title: 'probe', time: { updated: 10000 - i * 10 } });
+}
+FAKE_SESSIONS.splice(5, 0, { id: 'ses_real1', directory: '/home/flori/Dev/a', title: 'real one', time: { updated: 9955 }, permission: [{ x: 1 }] });
+FAKE_SESSIONS.push({ id: 'ses_real2', directory: '/home/flori/Dev/b', title: 'real two', time: { updated: 1 } });
 
 function makeUpstream() {
   return http.createServer((req, res) => {
@@ -77,6 +85,29 @@ function makeUpstream() {
       if (/^\/session\/ses_[A-Za-z0-9]+$/.test(path) && req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ id: path.split('/')[2], directory: url.searchParams.get('directory') }));
+        return;
+      }
+      if (path === '/file' && req.method === 'GET' && MISSING_DIRS.has(url.searchParams.get('directory'))) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end('{}');
+        return;
+      }
+      if (path === '/experimental/session' && req.method === 'GET') {
+        const lim = Number(url.searchParams.get('limit'));
+        const cur = url.searchParams.get('cursor');
+        const rows = FAKE_SESSIONS.filter((x) => !cur || x.time.updated < Number(cur)).slice(0, lim);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(rows));
+        return;
+      }
+      if (path === '/session/status' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(url.searchParams.get('directory') === '/home/flori/Dev/a' ? { ses_real1: { type: 'busy' } } : {}));
+        return;
+      }
+      if (path.startsWith('/question/') && path.endsWith('/reply') && req.method === 'POST') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('true');
         return;
       }
       if (path === '/file' && req.method === 'GET') {
@@ -296,4 +327,94 @@ test('POST /api/sessions rejects directory outside prefix', async () => {
   });
   assert.equal(r.status, 400);
   assert.ok(!calls.some((c) => c.method === 'POST' && c.path === '/session'));
+});
+test('POST /api/sessions with an empty directory runs in the default directory', async () => {
+  const cookie = await authed();
+  const origin = `http://127.0.0.1:${appServer.address().port}`;
+  calls.length = 0;
+  const r = await fetch(base + '/api/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', cookie, Origin: origin },
+    body: JSON.stringify({ directory: '  ', model: { providerID: 'chutes', modelID: 'm' }, prompt: 'hi' }),
+  });
+  assert.equal(r.status, 200);
+  const create = calls.find((c) => c.method === 'POST' && c.path === '/session');
+  assert.equal(create.query.directory, '/home/flori/Dev/temp');
+  // the default directory exists upstream, so no mkdir helper
+  assert.ok(!calls.some((c) => c.path.includes('/shell')));
+  const pc = calls.find((c) => c.path.endsWith('/prompt_async'));
+  assert.equal(pc.query.directory, '/home/flori/Dev/temp');
+});
+
+test('POST /api/sessions with createDirectory skips mkdir when the directory exists', async () => {
+  const cookie = await authed();
+  const origin = `http://127.0.0.1:${appServer.address().port}`;
+  calls.length = 0;
+  const r = await fetch(base + '/api/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', cookie, Origin: origin },
+    body: JSON.stringify({ directory: '/home/flori/Dev/exists', model: { providerID: 'chutes', modelID: 'm' }, prompt: 'hi', createDirectory: true }),
+  });
+  assert.equal(r.status, 200);
+  assert.ok(!calls.some((c) => c.path.includes('/shell')));
+  assert.equal(calls.filter((c) => c.method === 'POST' && c.path === '/session').length, 1);
+});
+
+test('GET /api/config exposes the new-session default directory', async () => {
+  const cookie = await authed();
+  const r = await fetch(base + '/api/config', { headers: { cookie } });
+  const d = await r.json();
+  assert.equal(d.newSessionDirectory, '/home/flori/Dev/temp');
+});
+
+test('GET /api/sessions?hideProbes=1 skips /tmp probe sessions across upstream pages', async () => {
+  const cookie = await authed();
+  const r = await fetch(base + '/api/sessions?limit=2&hideProbes=1', { headers: { cookie } });
+  assert.equal(r.status, 200);
+  const d = await r.json();
+  assert.deepEqual(d.sessions.map((x) => x.id), ['ses_real1', 'ses_real2']);
+  assert.equal(d.sessions[0].busy, true);
+  // list rows are slimmed down
+  assert.equal(d.sessions[0].permission, undefined);
+
+  const all = await (await fetch(base + '/api/sessions?limit=3', { headers: { cookie } })).json();
+  assert.deepEqual(all.sessions.map((x) => x.id), ['ses_p0', 'ses_p1', 'ses_p2']);
+  assert.equal(all.cursor, FAKE_SESSIONS[2].time.updated);
+
+  const bad = await fetch(base + '/api/sessions?cursor=abc', { headers: { cookie } });
+  assert.equal(bad.status, 400);
+});
+
+test('DELETE /api/sessions/:id deletes upstream', async () => {
+  const cookie = await authed();
+  const origin = `http://127.0.0.1:${appServer.address().port}`;
+  calls.length = 0;
+  const r = await fetch(base + '/api/sessions/ses_abc123', {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json', cookie, Origin: origin },
+    body: JSON.stringify({ directory: '/home/flori/Dev/temp' }),
+  });
+  assert.equal(r.status, 204);
+  const del = calls.find((c) => c.method === 'DELETE' && c.path === '/session/ses_abc123');
+  assert.equal(del.query.directory, '/home/flori/Dev/temp');
+});
+
+test('POST /api/questions/:id/reply forwards validated answers', async () => {
+  const cookie = await authed();
+  const origin = `http://127.0.0.1:${appServer.address().port}`;
+  calls.length = 0;
+  const ok = await fetch(base + '/api/questions/que_abc/reply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', cookie, Origin: origin },
+    body: JSON.stringify({ directory: '/home/flori/Dev', answers: [['Yes']] }),
+  });
+  assert.equal(ok.status, 204);
+  const c = calls.find((x) => x.path === '/question/que_abc/reply');
+  assert.deepEqual(c.body, { answers: [['Yes']] });
+  const bad = await fetch(base + '/api/questions/que_abc/reply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', cookie, Origin: origin },
+    body: JSON.stringify({ directory: '/home/flori/Dev', answers: [[{ x: 1 }]] }),
+  });
+  assert.equal(bad.status, 400);
 });

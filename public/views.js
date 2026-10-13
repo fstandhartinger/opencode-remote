@@ -1,1066 +1,1694 @@
-// opencode-remote views: list, new-session, and session transcript.
-// Depends on App (window.App) and Markdown (window.Markdown).
+// opencode-remote views: app shell (sidebar + main), new-session screen and the
+// live session transcript. Depends on App (window.App) and Markdown (window.Markdown).
+// The transcript renders incrementally (one DOM node per message and per part),
+// so streaming deltas never rebuild the whole timeline or collapse open tool calls.
 (function () {
   'use strict';
 
   var A = null; // App
+  var PAGE = 40;
+
   var state = {
+    config: { newSessionDirectory: '/home/flori/Dev/temp' },
+    // sidebar
     sessions: [],
-    hasMore: true,
+    cursor: null,
+    hasMore: false,
     search: '',
-    busySet: {},
+    hideProbes: readPref('ocr-hide-probes', true),
+    listLoading: false,
+    listSeq: 0,
+    busy: {},          // sessionID -> 'busy' | 'retry'
+    errors: readJSON('ocr-errors', {}), // sessionID -> message (last run failed)
     models: { featured: [], more: [] },
-    directorySuggest: [],
+    modelsLoaded: false,
+    suggestDirs: [],
     opencodeStatus: null,
-    loading: false,
-    // session view
+    // current route
+    route: null,
+    sessionID: null,
+    directory: '',
     session: null,
     messages: [],
     permissions: [],
     questions: [],
-    sessionID: null,
-    directory: '',
+    hasOlder: false,
+    oldestID: null,
+    loadingOlder: false,
     atBottom: true,
-    oldersBefore: null,
-    hasOlder: true,
-    loadingMoreOlder: false,
-    lastError: null
+    openParts: {},     // partID -> true for expanded tool/reasoning blocks
+    hadDisconnect: false
   };
 
-  var appRoot = null;
+  var dom = {};        // shell nodes
+  var msgEls = {};     // messageID -> element
+  var partEls = {};    // partID -> element
+  var pending = {};    // partID -> true (re-render scheduled)
+  var rafPending = false;
 
+  // ---------- small helpers ----------
+  function readPref(k, dflt) {
+    try { var v = localStorage.getItem(k); return v === null ? dflt : v === '1'; } catch (e) { return dflt; }
+  }
+  function writePref(k, v) { try { localStorage.setItem(k, v ? '1' : '0'); } catch (e) {} }
+  function readJSON(k, dflt) {
+    try { var v = JSON.parse(localStorage.getItem(k)); return v || dflt; } catch (e) { return dflt; }
+  }
+  function writeJSON(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+
+  function el(tag, cls, text) { return A.el(tag, cls, text); }
+  function icon(name, cls) {
+    var s = document.createElement('span');
+    s.className = 'icon' + (cls ? ' ' + cls : '');
+    s.setAttribute('aria-hidden', 'true');
+    s.innerHTML = ICONS[name] || ICONS.dot;
+    return s;
+  }
+  function btn(cls, label, onClick, iconName) {
+    var b = el('button', cls);
+    b.type = 'button';
+    if (iconName) b.appendChild(icon(iconName));
+    if (label) b.appendChild(el('span', 'btn-label', label));
+    if (onClick) b.addEventListener('click', onClick);
+    return b;
+  }
+
+  var SVG = function (body) {
+    return '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + body + '</svg>';
+  };
+  var ICONS = {
+    menu: SVG('<path d="M4 6h16M4 12h16M4 18h16"/>'),
+    plus: SVG('<path d="M12 5v14M5 12h14"/>'),
+    x: SVG('<path d="M18 6 6 18M6 6l12 12"/>'),
+    send: SVG('<path d="M12 19V5M5 12l7-7 7 7"/>'),
+    stop: '<svg viewBox="0 0 24 24" width="14" height="14"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor"/></svg>',
+    folder: SVG('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
+    terminal: SVG('<path d="m4 17 6-5-6-5M12 19h8"/>'),
+    file: SVG('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/>'),
+    edit: SVG('<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>'),
+    search: SVG('<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>'),
+    globe: SVG('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>'),
+    list: SVG('<path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/>'),
+    bot: SVG('<rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 4v4M9 13h.01M15 13h.01"/>'),
+    tool: SVG('<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/>'),
+    check: SVG('<path d="M20 6 9 17l-5-5"/>'),
+    alert: SVG('<path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'),
+    help: SVG('<circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/>'),
+    sun: SVG('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'),
+    moon: SVG('<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>'),
+    logout: SVG('<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>'),
+    trash: SVG('<path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/>'),
+    copy: SVG('<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>'),
+    down: SVG('<path d="M12 5v14M5 12l7 7 7-7"/>'),
+    up: SVG('<path d="m18 15-6-6-6 6"/>'),
+    chevron: SVG('<path d="m9 18 6-6-6-6"/>'),
+    dot: '<svg viewBox="0 0 24 24" width="10" height="10"><circle cx="12" cy="12" r="5" fill="currentColor"/></svg>'
+  };
+
+  function shortDir(d) { return A.homeShort(d); }
+  function modelKey(m) { return m ? m.providerID + '/' + m.modelID : ''; }
+  function sessionModelID(s) { return s && s.model ? (s.model.id || s.model.modelID || '') : ''; }
+  function sessionStatus(id) {
+    if (state.busy[id]) return 'running';
+    if (state.errors[id]) return 'error';
+    return 'idle';
+  }
+  function errText(e) {
+    if (!e) return '';
+    if (typeof e === 'string') return e;
+    if (e.data && e.data.message) return String(e.data.message);
+    if (e.message) return String(e.message);
+    if (e.name) return String(e.name);
+    try { return JSON.stringify(e); } catch (x) { return 'error'; }
+  }
+  // Stopping a run surfaces upstream as MessageAbortedError; that is the user's
+  // own action, not a failure.
+  function isAbort(e) {
+    return !!e && (e.name === 'MessageAbortedError' || /^aborted$/i.test(errText(e)));
+  }
+
+  function setError(id, msg) {
+    if (msg) state.errors[id] = String(msg).slice(0, 300);
+    else delete state.errors[id];
+    var keys = Object.keys(state.errors);
+    if (keys.length > 60) delete state.errors[keys[0]];
+    writeJSON('ocr-errors', state.errors);
+  }
+  function sessionHref(s) {
+    return '#/s/' + encodeURIComponent(s.id) + '?d=' + encodeURIComponent(s.directory || '');
+  }
+  function toast(text, kind) {
+    var t = el('div', 'toast' + (kind ? ' ' + kind : ''), text);
+    document.body.appendChild(t);
+    setTimeout(function () { t.classList.add('out'); }, 2600);
+    setTimeout(function () { t.remove(); }, 3000);
+  }
+  function copyText(text, b) {
+    function done() {
+      if (!b) return;
+      var lbl = b.querySelector('.btn-label') || b;
+      var old = lbl.textContent;
+      lbl.textContent = 'Copied';
+      b.classList.add('copied');
+      setTimeout(function () { lbl.textContent = old; b.classList.remove('copied'); }, 1400);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text); done(); });
+    } else { fallbackCopy(text); done(); }
+  }
+  function fallbackCopy(text) {
+    var ta = el('textarea', 'offscreen');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    ta.remove();
+  }
+
+  // ---------- init / shell ----------
   function init(App) {
     A = App;
-    appRoot = document.getElementById('app');
-  }
-
-  function setOpenCodeStatus(s) {
-    state.opencodeStatus = s;
-    renderStatusBanner();
-  }
-
-  function renderStatusBanner() {
-    var b = document.getElementById('banner');
-    if (!b) return;
-    if (state.opencodeStatus && state.opencodeStatus.opencode === 'down') {
-      b.textContent = 'opencode is unreachable \u2014 data may be stale.';
-      b.hidden = false;
-      b.classList.add('warn');
-    } else {
-      b.hidden = true;
-      b.classList.remove('warn');
-    }
-  }
-
-  function shortDir(dir) { return A.homeShort(dir); }
-  function statusOf(sid) { return state.busySet[sid] || null; }
-
-  // ---------- LIST VIEW ----------
-  function listView() {
-    state.sessions = [];
-    state.hasMore = true;
-    state.search = '';
-    state.cursor = null;
-    state.loading = false;
-    renderList();
-    A.connectEvents(null);
-    A.loadStatus();
+    buildShell();
+    A.api('/api/config').then(function (c) { if (c) state.config = c; refreshDirHint(); }).catch(function () {});
+    loadModels();
+    A.api('/api/directories/suggest').then(function (d) {
+      state.suggestDirs = (d && d.directories) || [];
+      renderRecentDirs();
+    }).catch(function () {});
     fetchList(false);
+    A.loadStatus();
+    setInterval(A.loadStatus, 60000);
+
+    // Delegated copy buttons (markdown code blocks); the CSP forbids inline handlers.
+    document.addEventListener('click', function (e) {
+      var b = e.target.closest && e.target.closest('.copy-btn[data-copy="code"]');
+      if (!b) return;
+      var block = b.closest('.codeblock');
+      var code = block && block.querySelector('pre');
+      if (code) copyText(code.textContent, b);
+    });
+    window.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') { closeDrawer(); closeModal(); }
+    });
   }
 
-  function buildListDOM() {
-    var c = document.createElement('div');
-    c.className = 'list-view';
+  function buildShell() {
+    var root = document.getElementById('app');
+    root.innerHTML = '';
+    var shell = el('div', 'shell');
 
-    var header = A.el('div', 'list-header');
-    header.appendChild(A.el('h1', 'title', 'Sessions'));
-    var newBtn = A.el('a', 'btn primary new-btn', 'New session');
+    var sb = el('aside', 'sidebar');
+    sb.id = 'sidebar';
+    var head = el('div', 'sb-head');
+    var brand = el('a', 'brand');
+    brand.href = '#/new';
+    brand.appendChild(el('span', 'brand-mark'));
+    brand.appendChild(document.createTextNode('opencode '));
+    brand.appendChild(el('span', 'brand-dim', 'remote'));
+    head.appendChild(brand);
+    var closeBtn = btn('icon-btn sb-close', '', closeDrawer, 'x');
+    closeBtn.setAttribute('aria-label', 'Close menu');
+    head.appendChild(closeBtn);
+    sb.appendChild(head);
+
+    var newBtn = el('a', 'btn primary block new-session-btn');
     newBtn.href = '#/new';
-    header.appendChild(newBtn);
-    c.appendChild(header);
+    newBtn.appendChild(icon('plus'));
+    newBtn.appendChild(el('span', 'btn-label', 'New session'));
+    sb.appendChild(newBtn);
 
-    var searchWrap = A.el('div', 'search-wrap');
-    var si = A.el('input', 'search-input');
+    var searchWrap = el('div', 'sb-search');
+    searchWrap.appendChild(icon('search'));
+    var si = el('input', 'sb-search-input');
     si.type = 'search';
-    si.placeholder = 'Search sessions\u2026';
+    si.placeholder = 'Search sessions';
     si.autocomplete = 'off';
-    si.value = state.search;
-    var t = null;
+    si.setAttribute('aria-label', 'Search sessions');
+    var tmr = null;
     si.addEventListener('input', function () {
-      clearTimeout(t);
-      t = setTimeout(function () {
+      clearTimeout(tmr);
+      tmr = setTimeout(function () {
         state.search = si.value.trim();
-        state.sessions = [];
-        state.cursor = null;
-        state.hasMore = true;
         fetchList(false);
       }, 250);
     });
     searchWrap.appendChild(si);
-    c.appendChild(searchWrap);
+    sb.appendChild(searchWrap);
 
-    var list = A.el('div', 'session-list');
-    list.id = 'session-list';
-    c.appendChild(list);
+    var filter = el('label', 'sb-filter');
+    var cb = el('input');
+    cb.type = 'checkbox';
+    cb.checked = state.hideProbes;
+    cb.addEventListener('change', function () {
+      state.hideProbes = cb.checked;
+      writePref('ocr-hide-probes', cb.checked);
+      fetchList(false);
+    });
+    filter.appendChild(cb);
+    filter.appendChild(el('span', null, 'Hide automated /tmp sessions'));
+    sb.appendChild(filter);
 
-    var moreBtn = A.el('button', 'btn load-more', 'Load more');
-    moreBtn.id = 'load-more';
-    moreBtn.hidden = true;
-    moreBtn.addEventListener('click', function () { fetchList(true); });
-    c.appendChild(moreBtn);
+    var list = el('nav', 'sb-list');
+    list.id = 'sb-list';
+    list.setAttribute('aria-label', 'Sessions');
+    sb.appendChild(list);
 
-    return c;
+    var foot = el('div', 'sb-foot');
+    var conn = el('div', 'conn');
+    conn.id = 'conn';
+    conn.appendChild(el('span', 'conn-dot'));
+    conn.appendChild(el('span', 'conn-label', 'connecting\u2026'));
+    foot.appendChild(conn);
+    var themeBtn = btn('icon-btn', '', toggleTheme, currentTheme() === 'dark' ? 'sun' : 'moon');
+    themeBtn.id = 'theme-btn';
+    themeBtn.title = 'Toggle light/dark';
+    themeBtn.setAttribute('aria-label', 'Toggle light or dark theme');
+    foot.appendChild(themeBtn);
+    var out = btn('icon-btn', '', logout, 'logout');
+    out.title = 'Sign out';
+    out.setAttribute('aria-label', 'Sign out');
+    foot.appendChild(out);
+    sb.appendChild(foot);
+
+    var backdrop = el('div', 'backdrop');
+    backdrop.addEventListener('click', closeDrawer);
+
+    var main = el('main', 'main');
+    main.id = 'main';
+
+    shell.appendChild(sb);
+    shell.appendChild(backdrop);
+    shell.appendChild(main);
+    root.appendChild(shell);
+    dom = { shell: shell, sidebar: sb, list: list, main: main, search: si };
   }
 
-  function renderList() {
-    appRoot.innerHTML = '';
-    appRoot.appendChild(buildListDOM());
-    renderListItems();
+  function openDrawer() { dom.shell.classList.add('drawer-open'); }
+  function closeDrawer() { if (dom.shell) dom.shell.classList.remove('drawer-open'); }
+
+  function currentTheme() { return document.documentElement.getAttribute('data-theme') || 'dark'; }
+  function toggleTheme() {
+    var t = currentTheme() === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', t);
+    try { localStorage.setItem('ocr-theme', t); } catch (e) {}
+    var b = document.getElementById('theme-btn');
+    if (b) { b.innerHTML = ''; b.appendChild(icon(t === 'dark' ? 'sun' : 'moon')); }
   }
 
-  function renderListItems() {
-    var list = document.getElementById('session-list');
+  function logout() {
+    fetch('/logout', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      .finally(function () { window.location.replace('/login.html'); });
+  }
+
+  function setOpenCodeStatus(s) {
+    state.opencodeStatus = s;
+    var b = document.getElementById('banner');
+    var down = s && s.opencode === 'down';
+    if (b) {
+      b.hidden = !down;
+      b.textContent = down ? 'opencode is unreachable \u2014 data may be stale.' : '';
+    }
+    var c = document.getElementById('conn');
+    if (c) {
+      c.className = 'conn ' + (down ? 'down' : 'up');
+      c.querySelector('.conn-label').textContent = down ? 'opencode offline' : ('opencode ' + (s && s.version ? 'v' + s.version : 'online'));
+    }
+  }
+
+  function topbar(titleNode, extra) {
+    var bar = el('header', 'topbar');
+    var m = btn('icon-btn menu-btn', '', openDrawer, 'menu');
+    m.setAttribute('aria-label', 'Open sessions');
+    bar.appendChild(m);
+    bar.appendChild(titleNode);
+    if (extra) extra.forEach(function (x) { bar.appendChild(x); });
+    return bar;
+  }
+
+  // ---------- SIDEBAR LIST ----------
+  function fetchList(append) {
+    var seq = ++state.listSeq;
+    state.listLoading = true;
+    if (!append) { state.cursor = null; renderList(); }
+    var q = '/api/sessions?limit=' + PAGE;
+    if (append && state.cursor) q += '&cursor=' + encodeURIComponent(state.cursor);
+    if (state.search) q += '&search=' + encodeURIComponent(state.search);
+    if (state.hideProbes) q += '&hideProbes=1';
+    A.api(q).then(function (data) {
+      if (seq !== state.listSeq) return;
+      state.listLoading = false;
+      var rows = (data && data.sessions) || [];
+      rows.forEach(function (s) {
+        if (s.busy) state.busy[s.id] = 'busy';
+        else if (s.busy === false) delete state.busy[s.id];
+      });
+      state.sessions = append ? state.sessions.concat(rows) : rows;
+      state.cursor = data && data.cursor ? data.cursor : null;
+      state.hasMore = !!state.cursor;
+      renderList();
+    }).catch(function () {
+      if (seq !== state.listSeq) return;
+      state.listLoading = false;
+      renderList(true);
+    });
+  }
+
+  function dayBucket(ts) {
+    if (!ts) return 'Older';
+    var d = new Date(ts);
+    var now = new Date();
+    var start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    if (d.getTime() >= start) return 'Today';
+    if (d.getTime() >= start - 86400000) return 'Yesterday';
+    if (d.getTime() >= start - 6 * 86400000) return 'Previous 7 days';
+    if (d.getTime() >= start - 29 * 86400000) return 'Previous 30 days';
+    return 'Older';
+  }
+
+  function renderList(failed) {
+    var list = dom.list;
     if (!list) return;
-    if (state.loading && state.sessions.length === 0) {
-      list.textContent = 'Loading\u2026';
+    var keep = list.scrollTop;
+    list.innerHTML = '';
+    if (state.listLoading && !state.sessions.length) {
+      for (var i = 0; i < 6; i++) list.appendChild(el('div', 'sb-skel'));
       return;
     }
-    list.textContent = '';
-    if (state.sessions.length === 0) {
-      list.appendChild(A.el('div', 'empty', 'No sessions found.'));
-      var lb = document.getElementById('load-more');
-      if (lb) lb.hidden = true;
+    if (failed && !state.sessions.length) {
+      list.appendChild(el('div', 'sb-empty', 'Could not load sessions.'));
+      list.appendChild(btn('btn small', 'Retry', function () { fetchList(false); }));
       return;
     }
-    state.sessions.forEach(function (s) { list.appendChild(sessionRow(s)); });
-    var lb2 = document.getElementById('load-more');
-    if (lb2) lb2.hidden = !state.hasMore;
+    if (!state.sessions.length) {
+      list.appendChild(el('div', 'sb-empty', state.search ? 'No sessions match.' : 'No sessions yet.'));
+      return;
+    }
+    var lastBucket = null;
+    state.sessions.forEach(function (s) {
+      var b = dayBucket(s.time && s.time.updated);
+      if (b !== lastBucket) {
+        list.appendChild(el('div', 'sb-group', b));
+        lastBucket = b;
+      }
+      list.appendChild(sessionRow(s));
+    });
+    if (state.hasMore) {
+      var more = btn('btn ghost small block', state.listLoading ? 'Loading\u2026' : 'Load more', function () { fetchList(true); });
+      list.appendChild(more);
+    }
+    list.scrollTop = keep;
   }
 
   function sessionRow(s) {
-    var row = A.el('a', 'session-row');
-    row.href = '#/s/' + encodeURIComponent(s.id) + '?d=' + encodeURIComponent(s.directory || '');
-    var busy = statusOf(s.id);
-    var top = A.el('div', 'row-top');
-    var ttl = A.el('span', 'row-title', s.title || s.slug || s.id);
-    top.appendChild(ttl);
-    if (busy) top.appendChild(A.el('span', 'dot', '\u2022'));
-    row.appendChild(top);
-
-    var meta = A.el('div', 'row-meta');
-    if (s.directory) meta.appendChild(A.el('span', 'row-dir', shortDir(s.directory)));
-    // Upstream sessions carry model as {id, providerID}, not {modelID}.
-    var rowModel = sessionModelID(s);
-    if (rowModel) {
-      meta.appendChild(A.el('span', 'row-model', String(rowModel).split('/').pop()));
-    }
-    var cost = A.fmtCost(s.cost);
-    if (cost) meta.appendChild(A.el('span', 'row-cost', cost));
-    var updated = A.relTime(s.time && s.time.updated);
-    if (updated) meta.appendChild(A.el('span', 'row-time', updated));
-    row.appendChild(meta);
-
-    // summary is {additions, deletions, files}; only show it when files changed.
-    if (s.summary && s.summary.files) {
-      var sum = A.el('div', 'row-summary',
-        s.summary.files + (s.summary.files === 1 ? ' file' : ' files') +
-        ', +' + (s.summary.additions || 0) + ' −' + (s.summary.deletions || 0));
-      row.appendChild(sum);
-    }
+    var st = sessionStatus(s.id);
+    var row = el('a', 'sb-row status-' + st + (s.id === state.sessionID ? ' active' : ''));
+    row.href = sessionHref(s);
+    row.dataset.id = s.id;
+    var ind = el('span', 'sb-ind');
+    ind.title = st === 'running' ? 'Running' : st === 'error' ? 'Last run failed' : 'Idle';
+    row.appendChild(ind);
+    var body = el('span', 'sb-row-body');
+    body.appendChild(el('span', 'sb-title', s.title || s.slug || 'Untitled session'));
+    var meta = el('span', 'sb-meta');
+    meta.appendChild(el('span', 'sb-dir', shortDir(s.directory)));
+    var t = A.relTime(s.time && s.time.updated);
+    if (st === 'running') meta.appendChild(el('span', 'sb-state', 'running'));
+    else if (st === 'error') meta.appendChild(el('span', 'sb-state err', 'error'));
+    else if (t) meta.appendChild(el('span', 'sb-time', t));
+    body.appendChild(meta);
+    row.appendChild(body);
+    row.addEventListener('click', closeDrawer);
     return row;
   }
 
-  function sessionModelID(s) {
-    return s && s.model ? (s.model.id || s.model.modelID || '') : '';
+  function upsertListSession(info) {
+    if (!info || !info.id) return;
+    if (state.hideProbes && info.directory && info.directory.indexOf('/tmp/') === 0) return;
+    var idx = -1;
+    state.sessions.forEach(function (s, i) { if (s.id === info.id) idx = i; });
+    if (idx >= 0) {
+      var merged = Object.assign({}, state.sessions[idx], info);
+      state.sessions.splice(idx, 1);
+      state.sessions.unshift(merged);
+    } else {
+      if (info.parentID) return; // child (sub-agent) sessions stay out of the list
+      if (state.search) return;
+      state.sessions.unshift(info);
+    }
+    state.sessions.sort(function (a, b) { return ((b.time && b.time.updated) || 0) - ((a.time && a.time.updated) || 0); });
+    scheduleListRender();
   }
 
-  function fetchList(append) {
-    state.loading = true;
-    var q = '/api/sessions?limit=50';
-    if (state.cursor) q += '&cursor=' + encodeURIComponent(state.cursor);
-    if (state.search) q += '&search=' + encodeURIComponent(state.search);
-    A.api(q).then(function (data) {
-      state.loading = false;
-      var sessions = Array.isArray(data) ? data : (data.sessions || []);
-      var cursor = null;
-      if (data && data.cursor) cursor = data.cursor;
-      // merge busy status if the backend included it per session
-      if (Array.isArray(data) && data.length) {
-        data.forEach(function (s) {
-          if (s && s.status) {
-            if (s.status === 'idle') delete state.busySet[s.id];
-            else state.busySet[s.id] = s.status;
-          }
-        });
-      }
-      if (!append) state.sessions = sessions;
-      else state.sessions = state.sessions.concat(sessions);
-      state.cursor = cursor;
-      state.hasMore = sessions.length > 0;
-      renderListItems();
+  var listTimer = null;
+  function scheduleListRender() {
+    if (listTimer) return;
+    listTimer = setTimeout(function () { listTimer = null; renderList(); }, 150);
+  }
+
+  // ---------- models ----------
+  function loadModels() {
+    return A.api('/api/models').then(function (m) {
+      state.models = m || { featured: [], more: [] };
+      state.modelsLoaded = true;
+      document.querySelectorAll('select.model-select').forEach(function (sel) { fillModelSelect(sel); });
     }).catch(function () {
-      state.loading = false;
-      var list = document.getElementById('session-list');
-      if (list && state.sessions.length === 0) list.textContent = 'Failed to load sessions.';
+      document.querySelectorAll('select.model-select').forEach(function (sel) {
+        sel.innerHTML = '';
+        sel.appendChild(el('option', null, 'Models unavailable'));
+      });
+    });
+  }
+
+  function modelLabel(m) {
+    var free = /:free$/.test(m.modelID) || m.providerID === 'chutes';
+    return m.modelName + ' \u00b7 ' + m.providerName + (free ? ' \u00b7 free' : '');
+  }
+
+  function fillModelSelect(sel) {
+    var prefer = sel.dataset.prefer || '';
+    sel.innerHTML = '';
+    ['featured', 'more'].forEach(function (gn) {
+      var models = state.models[gn] || [];
+      if (!models.length) return;
+      var og = el('optgroup');
+      og.label = gn === 'featured' ? 'Recommended' : 'More models';
+      models.forEach(function (m) {
+        var o = el('option', null, modelLabel(m));
+        o.value = modelKey(m);
+        og.appendChild(o);
+      });
+      sel.appendChild(og);
+    });
+    if (prefer && !sel.querySelector('option[value="' + cssEsc(prefer) + '"]')) {
+      var own = el('option', null, 'Session model \u2014 ' + prefer.split('/').slice(1).join('/'));
+      own.value = prefer;
+      sel.insertBefore(own, sel.firstChild);
+    }
+    var last = A.getLastModel();
+    var want = prefer || (last ? modelKey(last) : '');
+    if (want && sel.querySelector('option[value="' + cssEsc(want) + '"]')) sel.value = want;
+    if (!sel.options.length) sel.appendChild(el('option', null, state.modelsLoaded ? 'No models' : 'Loading models\u2026'));
+  }
+
+  function cssEsc(s) { return String(s).replace(/["\\]/g, '\\$&'); }
+
+  function modelSelect(prefer) {
+    var sel = el('select', 'model-select pill');
+    sel.setAttribute('aria-label', 'Model');
+    if (prefer) sel.dataset.prefer = prefer;
+    fillModelSelect(sel);
+    return sel;
+  }
+
+  function selectedModel(sel) {
+    var val = sel.value || '';
+    var slash = val.indexOf('/');
+    if (slash === -1) return null;
+    return { providerID: val.slice(0, slash), modelID: val.slice(slash + 1) };
+  }
+
+  // ---------- composer (shared by new + session) ----------
+  function autosize(ta) {
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, Math.round(window.innerHeight * 0.4)) + 'px';
+  }
+
+  // Enter sends, Shift+Enter inserts a newline (IME composition is left alone).
+  function wireComposer(ta, submit) {
+    ta.addEventListener('input', function () { autosize(ta); });
+    ta.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+        e.preventDefault();
+        submit();
+      }
     });
   }
 
   // ---------- NEW SESSION VIEW ----------
-  function buildNewDOM() {
-    var c = A.el('div', 'new-view');
-
-    var back = A.el('a', 'btn back', '\u2190 Sessions');
-    back.href = '#/';
-    c.appendChild(back);
-
-    c.appendChild(A.el('h1', 'title', 'New session'));
-
-    var form = A.el('form', 'new-form');
-    form.id = 'new-form';
-
-    var lblDir = A.el('label', 'lbl', 'Directory');
-    var dirWrap = A.el('div', 'dir-row');
-    var dirInput = A.el('input', 'text-input');
-    dirInput.id = 'dir-input';
-    dirInput.type = 'text';
-    dirInput.placeholder = '/home/flori/Dev/\u2026';
-    dirInput.autocomplete = 'off';
-    dirInput.setAttribute('list', 'dir-suggest');
-
-    var createChk = A.el('label', 'chk');
-    var cb = A.el('input');
-    cb.id = 'create-dir';
-    cb.type = 'checkbox';
-    createChk.appendChild(cb);
-    createChk.appendChild(document.createTextNode(' create if missing'));
-
-    var browseBtn = A.el('button', 'btn browse', 'Browse');
-    browseBtn.type = 'button';
-    browseBtn.id = 'browse-btn';
-    browseBtn.addEventListener('click', function () {
-      var overlay = buildBrowseOverlay();
-      document.body.appendChild(overlay);
+  function recentDirs() {
+    var r = readJSON('ocr-recent-dirs', []);
+    var all = [];
+    r.concat(state.suggestDirs).forEach(function (d) {
+      if (d && all.indexOf(d) === -1 && d !== state.config.newSessionDirectory) all.push(d);
     });
-
-    dirWrap.appendChild(dirInput);
-    dirWrap.appendChild(browseBtn);
-    dirWrap.appendChild(createChk);
-
-    var dl = A.el('datalist', null);
-    dl.id = 'dir-suggest';
-
-    var lblModel = A.el('label', 'lbl', 'Model');
-    var modelSel = A.el('select', 'select', null);
-    modelSel.id = 'model-select';
-
-    var lblTitle = A.el('label', 'lbl', 'Title (optional)');
-    var titleInput = A.el('input', 'text-input');
-    titleInput.id = 'title-input';
-    titleInput.type = 'text';
-
-    var lblPrompt = A.el('label', 'lbl', 'Prompt');
-    var prompt = A.el('textarea', 'prompt-input');
-    prompt.id = 'prompt-input';
-    prompt.placeholder = 'What should the agent do?\n(Ctrl+Enter or Cmd+Enter to submit)';
-    prompt.addEventListener('keydown', function (e) {
-      if ((e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.keyCode === 13)) {
-        e.preventDefault();
-        form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
-      }
-    });
-
-    var errBox = A.el('div', 'err');
-    errBox.id = 'new-err';
-
-    var submitBtn = A.el('button', 'btn primary', 'Create');
-    submitBtn.type = 'submit';
-
-    form.appendChild(lblDir);
-    form.appendChild(dirWrap);
-    form.appendChild(dl);
-    form.appendChild(lblModel);
-    form.appendChild(modelSel);
-    form.appendChild(lblTitle);
-    form.appendChild(titleInput);
-    form.appendChild(lblPrompt);
-    form.appendChild(prompt);
-    form.appendChild(errBox);
-    form.appendChild(submitBtn);
-    form.addEventListener('submit', submitNew);
-    c.appendChild(form);
-    return c;
+    return all.slice(0, 6);
+  }
+  function rememberDir(d) {
+    var r = readJSON('ocr-recent-dirs', []).filter(function (x) { return x !== d; });
+    r.unshift(d);
+    writeJSON('ocr-recent-dirs', r.slice(0, 10));
   }
 
   function newView() {
-    appRoot.innerHTML = '';
-    appRoot.appendChild(buildNewDOM());
-    A.loadStatus();
-    A.api('/api/models').then(function (m) {
-      state.models = m || { featured: [], more: [] };
-      fillModelSelect();
-    }).catch(function () {
-      var sel = document.getElementById('model-select');
-      if (sel) {
-        sel.innerHTML = '';
-        sel.appendChild(A.el('option', null, 'Models unavailable'));
-      }
-    });
-    A.api('/api/directories/suggest').then(function (d) {
-      state.directorySuggest = d && d.directories ? d.directories : (Array.isArray(d) ? d : []);
-      fillSuggestions();
-    }).catch(function () {});
-    // prefill with last model if available
-    var last = A.getLastModel ? A.getLastModel() : null;
-    if (last) {
-      var ls = document.getElementById('model-select');
-      if (ls) {
-        ls.dataset.last = last.providerID + '/' + last.modelID;
-      }
-    }
+    state.route = 'new';
+    resetSession();
+    highlightActive();
+    A.connectEvents(null);
+    var main = dom.main;
+    main.innerHTML = '';
+    main.appendChild(topbar(el('div', 'tb-title', 'New session')));
+
+    var wrap = el('div', 'new-wrap');
+    var center = el('div', 'new-center');
+    center.appendChild(el('h1', 'hero', 'What should we build?'));
+    center.appendChild(el('p', 'hero-sub', 'Starts an opencode agent on Sandy. It keeps running when you close this tab.'));
+
+    var form = el('form', 'composer-card big');
+    form.id = 'new-form';
+    var ta = el('textarea', 'composer-input');
+    ta.id = 'prompt-input';
+    ta.rows = 3;
+    ta.placeholder = 'Describe the task\u2026';
+    ta.setAttribute('aria-label', 'First prompt');
+    form.appendChild(ta);
+
+    var bar = el('div', 'composer-bar');
+    var dirPill = btn('pill dir-pill', '', function () { dirInput.focus(); dirInput.select(); }, 'folder');
+    dirPill.id = 'dir-pill';
+    dirPill.title = 'Working directory';
+    bar.appendChild(dirPill);
+    var sel = modelSelect(null);
+    sel.id = 'model-select';
+    bar.appendChild(sel);
+    bar.appendChild(el('span', 'spacer'));
+    var send = el('button', 'send-btn');
+    send.type = 'submit';
+    send.setAttribute('aria-label', 'Start session');
+    send.appendChild(icon('send'));
+    bar.appendChild(send);
+    form.appendChild(bar);
+    center.appendChild(form);
+
+    // directory section
+    var dirBox = el('div', 'dir-box');
+    var lbl = el('label', 'field-label', 'Working directory');
+    lbl.setAttribute('for', 'dir-input');
+    dirBox.appendChild(lbl);
+    var dirRow = el('div', 'dir-row');
+    var dirInput = el('input', 'text-input');
+    dirInput.id = 'dir-input';
+    dirInput.type = 'text';
+    dirInput.placeholder = state.config.newSessionDirectory + ' (default)';
+    dirInput.autocomplete = 'off';
+    dirInput.autocapitalize = 'off';
+    dirInput.spellcheck = false;
+    dirInput.addEventListener('input', refreshDirHint);
+    dirRow.appendChild(dirInput);
+    dirRow.appendChild(btn('btn', 'Browse', function () { openBrowse(dirInput); }, 'folder'));
+    dirBox.appendChild(dirRow);
+    var chips = el('div', 'chips');
+    chips.id = 'dir-chips';
+    dirBox.appendChild(chips);
+    var createRow = el('label', 'check-row');
+    var cb = el('input');
+    cb.type = 'checkbox';
+    cb.id = 'create-dir';
+    cb.checked = true;
+    createRow.appendChild(cb);
+    createRow.appendChild(el('span', null, 'Create the folder if it does not exist'));
+    dirBox.appendChild(createRow);
+    center.appendChild(dirBox);
+
+    var err = el('div', 'form-error');
+    err.id = 'new-err';
+    err.hidden = true;
+    center.appendChild(err);
+    center.appendChild(el('p', 'hint', 'Enter to start \u00b7 Shift+Enter for a new line'));
+
+    wrap.appendChild(center);
+    main.appendChild(wrap);
+
+    function submit() { submitNew(form, ta, dirInput, sel, cb, send, err); }
+    wireComposer(ta, submit);
+    form.addEventListener('submit', function (e) { e.preventDefault(); submit(); });
+    renderRecentDirs();
+    refreshDirHint();
+    if (!window.matchMedia('(pointer: coarse)').matches) ta.focus();
   }
 
-  function fillModelSelect() {
-    var sel = document.getElementById('model-select');
-    if (!sel) return;
-    sel.innerHTML = '';
-    var groups = ['featured', 'more'];
-    groups.forEach(function (gn) {
-      var models = state.models[gn] || [];
-      if (!models.length) return;
-      var og = A.el('optgroup', null);
-      og.label = gn === 'featured' ? 'Featured' : 'More models';
-      models.forEach(function (m) {
-        var o = A.el('option', null);
-        o.value = m.providerID + '/' + m.modelID;
-        o.textContent = m.providerName + ' \u2014 ' + m.modelName + (m.modelID.indexOf(':free') !== -1 ? ' :free' : '');
-        og.appendChild(o);
+  function effectiveDir() {
+    var di = document.getElementById('dir-input');
+    var v = di ? di.value.trim() : '';
+    return v || state.config.newSessionDirectory;
+  }
+
+  function refreshDirHint() {
+    var di = document.getElementById('dir-input');
+    if (di) di.placeholder = state.config.newSessionDirectory + ' (default)';
+    var pill = document.getElementById('dir-pill');
+    if (!pill) return;
+    var lbl = pill.querySelector('.btn-label');
+    if (!lbl) { lbl = el('span', 'btn-label'); pill.appendChild(lbl); }
+    var d = effectiveDir();
+    lbl.textContent = d.replace(/\/+$/, '').split('/').pop() || d;
+    pill.title = 'Working directory: ' + d;
+    document.querySelectorAll('#dir-chips .chip').forEach(function (c) {
+      c.classList.toggle('on', c.dataset.dir === d);
+    });
+  }
+
+  function renderRecentDirs() {
+    var chips = document.getElementById('dir-chips');
+    if (!chips) return;
+    chips.innerHTML = '';
+    var di = document.getElementById('dir-input');
+    function chip(d, label) {
+      var c = btn('chip', label || shortDir(d), function () {
+        if (di) di.value = d === state.config.newSessionDirectory ? '' : d;
+        refreshDirHint();
       });
-      sel.appendChild(og);
-    });
-    if (!sel.options.length) sel.appendChild(A.el('option', null, 'No models'));
-    var last = sel.dataset.last;
-    if (last) {
-      var opt = sel.querySelector('option[value="' + last + '"]');
-      if (opt) sel.value = last;
+      c.dataset.dir = d;
+      c.title = d;
+      chips.appendChild(c);
     }
+    chip(state.config.newSessionDirectory, shortDir(state.config.newSessionDirectory) + ' \u00b7 default');
+    recentDirs().forEach(function (d) { chip(d); });
+    refreshDirHint();
   }
 
-  function fillSuggestions() {
-    var dl = document.getElementById('dir-suggest');
-    if (!dl) return;
-    dl.innerHTML = '';
-    state.directorySuggest.forEach(function (d) {
-      dl.appendChild(A.el('option', null, d));
-    });
-  }
-
-  function submitNew(e) {
-    e.preventDefault();
-    var btn = e.target.querySelector('button[type=submit]');
-    if (btn) btn.disabled = true;
-    var directory = (document.getElementById('dir-input').value || '').trim();
-    var title = (document.getElementById('title-input').value || '').trim();
-    var prompt = (document.getElementById('prompt-input').value || '').trim();
-    var modelVal = document.getElementById('model-select').value || '';
-    var createDirectory = document.getElementById('create-dir').checked;
-    var slash = modelVal.indexOf('/');
-    var providerID = slash === -1 ? modelVal : modelVal.slice(0, slash);
-    var modelID = slash === -1 ? '' : modelVal.slice(slash + 1);
-    var errBox = document.getElementById('new-err');
-    if (!directory || !prompt) {
-      if (errBox) { errBox.textContent = 'Directory and prompt are required.'; errBox.hidden = false; }
-      if (btn) btn.disabled = false;
-      return;
-    }
-    var body = {
-     ['directory']: directory,
-      prompt: prompt,
-      model: { providerID: providerID, modelID: modelID },
-      createDirectory: createDirectory
-    };
-    if (title) body.title = title;
-    if (modelID) A.saveLastModel(body.model);
+  function submitNew(form, ta, dirInput, sel, cb, send, errBox) {
+    var prompt = ta.value.trim();
+    var directory = dirInput.value.trim();
+    var model = selectedModel(sel);
+    errBox.hidden = true;
+    if (!prompt) { ta.focus(); return; }
+    if (!model) { showErr('Pick a model first.'); return; }
+    if (form.dataset.busy) return;
+    form.dataset.busy = '1';
+    send.disabled = true;
+    send.classList.add('loading');
+    var body = { directory: directory, prompt: prompt, model: model, createDirectory: cb.checked };
+    A.saveLastModel(model);
     A.api('/api/sessions', { method: 'POST', body: body }).then(function (res) {
-      var s = res.session || res;
-      window.location.hash = '#/s/' + encodeURIComponent(s.id) + '?d=' + encodeURIComponent(directory);
-    }).catch(function (err) {
-      if (errBox) { errBox.textContent = err.message || 'Failed to create session.'; errBox.hidden = false; }
-      if (btn) btn.disabled = false;
+      var s = (res && res.session) || res;
+      var dir = s.directory || directory || state.config.newSessionDirectory;
+      rememberDir(dir);
+      upsertListSession(Object.assign({}, s, { directory: dir }));
+      state.busy[s.id] = 'busy';
+      state.pendingPrompt = { sessionID: s.id, text: prompt };
+      window.location.hash = '#/s/' + encodeURIComponent(s.id) + '?d=' + encodeURIComponent(dir);
+    }).catch(function (e) {
+      delete form.dataset.busy;
+      send.disabled = false;
+      send.classList.remove('loading');
+      showErr(e.message || 'Could not start the session.');
     });
+    function showErr(m) { errBox.textContent = m; errBox.hidden = false; }
   }
 
-  function buildBrowseOverlay() {
-    var overlay = A.el('div', 'modal-overlay');
-    var box = A.el('div', 'modal');
-    box.appendChild(A.el('h3', 'modal-title', 'Browse directory'));
-    var pathRow = A.el('div', 'browse-path');
-    var input = A.el('input', 'text-input');
-    input.id = 'browse-path';
-    input.value = (document.getElementById('dir-input') && document.getElementById('dir-input').value) || '/home/flori/';
-    pathRow.appendChild(input);
-    box.appendChild(pathRow);
-    var list = A.el('div', 'browse-list');
+  // ---------- directory browser ----------
+  function closeModal() {
+    var m = document.querySelector('.modal-overlay');
+    if (m) m.remove();
+  }
+
+  function openBrowse(target) {
+    closeModal();
+    var overlay = el('div', 'modal-overlay');
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) closeModal(); });
+    var box = el('div', 'modal');
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', 'Choose a directory');
+    var head = el('div', 'modal-head');
+    head.appendChild(el('h3', 'modal-title', 'Choose a directory'));
+    head.appendChild(btn('icon-btn', '', closeModal, 'x'));
+    box.appendChild(head);
+    var input = el('input', 'text-input mono');
+    input.value = target.value.trim() || state.config.newSessionDirectory;
+    input.autocapitalize = 'off';
+    input.spellcheck = false;
+    box.appendChild(input);
+    var list = el('div', 'browse-list');
     box.appendChild(list);
-    var btnRow = A.el('div', 'modal-btns');
-    var ok = A.el('button', 'btn primary', 'Use this directory');
-    var cancel = A.el('button', 'btn', 'Cancel');
-    btnRow.appendChild(ok);
-    btnRow.appendChild(cancel);
-    box.appendChild(btnRow);
+    var actions = el('div', 'modal-btns');
+    actions.appendChild(btn('btn', 'Cancel', closeModal));
+    actions.appendChild(btn('btn primary', 'Use this folder', function () {
+      target.value = input.value.trim().replace(/\/+$/, '') || '';
+      closeModal();
+      refreshDirHint();
+    }));
+    box.appendChild(actions);
     overlay.appendChild(box);
+    document.body.appendChild(overlay);
 
     function load(path) {
-      list.textContent = '';
-      list.appendChild(A.el('div', 'browse-loading', 'Loading\u2026'));
+      path = path.replace(/\/+$/, '') || '/';
+      input.value = path;
+      list.innerHTML = '';
+      list.appendChild(el('div', 'browse-loading', 'Loading\u2026'));
       A.api('/api/directories?path=' + encodeURIComponent(path)).then(function (d) {
-        list.textContent = '';
-        var dirs = d && d.directories ? d.directories : (Array.isArray(d) ? d : []);
-        if (!dirs.length) list.appendChild(A.el('div', 'empty', '(no subdirectories)'));
+        list.innerHTML = '';
+        var parent = path.replace(/\/[^/]+$/, '');
+        if (parent && parent.length >= (state.config.allowedPrefix || '/home/flori/').replace(/\/$/, '').length) {
+          var up = btn('browse-item up', '..', function () { load(parent); }, 'up');
+          list.appendChild(up);
+        }
+        var dirs = (d && d.directories) || [];
+        if (!dirs.length) list.appendChild(el('div', 'browse-empty', 'No subfolders'));
         dirs.forEach(function (dir) {
-          var item = A.el('div', 'browse-item', dir);
-          item.addEventListener('click', function () { input.value = dir; load(dir); });
-          list.appendChild(item);
+          var name = dir.split('/').pop();
+          list.appendChild(btn('browse-item', name, function () { load(dir); }, 'folder'));
         });
       }).catch(function (err) {
-        list.textContent = 'Error: ' + (err.message || '');
+        list.innerHTML = '';
+        list.appendChild(el('div', 'browse-empty', err.message || 'Cannot list this folder'));
       });
     }
-    input.addEventListener('change', function () { load(input.value); });
-    ok.addEventListener('click', function () {
-      var di = document.getElementById('dir-input');
-      if (di) di.value = input.value;
-      document.body.removeChild(overlay);
-    });
-    cancel.addEventListener('click', function () { document.body.removeChild(overlay); });
+    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); load(input.value.trim()); } });
     load(input.value);
-    return overlay;
   }
 
   // ---------- SESSION VIEW ----------
-  function sessionView(id, dir, params) {
+  function resetSession() {
+    state.sessionID = null;
+    state.directory = '';
     state.session = null;
     state.messages = [];
     state.permissions = [];
     state.questions = [];
+    state.hasOlder = false;
+    state.oldestID = null;
+    state.atBottom = true;
+    state.openParts = {};
+    msgEls = {};
+    partEls = {};
+    pending = {};
+  }
+
+  function highlightActive() {
+    if (!dom.list) return;
+    dom.list.querySelectorAll('.sb-row').forEach(function (r) {
+      r.classList.toggle('active', r.dataset.id === state.sessionID);
+    });
+  }
+
+  function sessionView(id, dir) {
+    var keepPending = state.pendingPrompt && state.pendingPrompt.sessionID === id ? state.pendingPrompt : null;
+    resetSession();
+    state.route = 'session';
     state.sessionID = id;
     state.directory = dir || '';
-    state.atBottom = true;
-    state.oldersBefore = null;
-    state.hasOlder = false;
-    state.loadingMoreOlder = false;
-    state.lastError = null;
+    state.pendingPrompt = keepPending;
+    highlightActive();
 
-    appRoot.innerHTML = '';
-    var c = A.el('div', 'session-view');
-    c.id = 'session-view';
-    c.appendChild(A.el('div', 'session-loading', 'Loading session\u2026'));
-    appRoot.appendChild(c);
+    var main = dom.main;
+    main.innerHTML = '';
+    var titleBox = el('div', 'tb-main');
+    titleBox.appendChild(el('div', 'tb-title', '\u2026'));
+    titleBox.appendChild(el('div', 'tb-sub', shortDir(dir)));
+    var badge = el('span', 'status-badge');
+    badge.id = 'status-badge';
+    var del = btn('icon-btn', '', deleteSession, 'trash');
+    del.title = 'Delete session';
+    del.setAttribute('aria-label', 'Delete session');
+    var bar = topbar(titleBox, [badge, del]);
+    bar.id = 'session-topbar';
+    main.appendChild(bar);
 
-    A.loadStatus();
-    A.connectEvents(id);
-    fetchSession();
-    // The composer's model select needs the model list; the session view can be
-    // opened directly (list click, link), without visiting #/new first.
-    if (!state.models.featured.length && !state.models.more.length) {
-      A.api('/api/models').then(function (m) {
-        state.models = m || { featured: [], more: [] };
-        var sel = document.getElementById('composer-model');
-        if (sel) fillComposerModelSelect(sel);
-      }).catch(function () {});
-    }
-  }
-
-  function fetchSession() {
-    var q = '/api/sessions/' + encodeURIComponent(state.sessionID);
-    if (state.directory) q += '?directory=' + encodeURIComponent(state.directory);
-    A.api(q).then(function (d) {
-      state.session = d.session;
-      state.messages = d.messages || [];
-      state.hasOlder = (d.messages || []).length >= 200;
-      if (state.hasOlder) state.oldersBefore = oldestMessageID(state.messages);
-      renderSession();
-      scrollToBottom(true);
-    }).catch(function (err) {
-      var view = document.getElementById('session-view');
-      if (!view) return;
-      view.innerHTML = '';
-      view.appendChild(A.el('div', 'empty', 'Failed to load session: ' + (err.message || '')));
-      var back = A.el('a', 'btn', '\u2190 Back');
-      back.href = '#/';
-      view.appendChild(back);
-    });
-  }
-
-  function oldestMessageID(messages) {
-    var oldest = null;
-    messages.forEach(function (m) {
-      if (m && m.info && m.info.id) {
-        if (!oldest || m.info.id < oldest) oldest = m.info.id;
-      }
-    });
-    return oldest;
-  }
-
-  function renderSession() {
-    var view = document.getElementById('session-view');
-    if (!view) return;
-    view.innerHTML = '';
-    view.appendChild(headerDOM());
-    view.appendChild(permBanner());
-    view.appendChild(timelineDOM());
-    view.appendChild(composerDOM());
-  }
-
-  function headerDOM() {
-    var s = state.session || {};
-    var h = A.el('div', 'session-header');
-    var top = A.el('div', 'head-top');
-    var back = A.el('a', 'btn', '\u2190');
-    back.href = '#/';
-    back.title = 'Back to sessions';
-    top.appendChild(back);
-    top.appendChild(A.el('h1', 'head-title', s.title || s.slug || s.id));
-    var st = statusOf(s.id);
-    if (st) top.appendChild(A.el('span', 'dot', '\u2022'));
-    h.appendChild(top);
-
-    var meta = A.el('div', 'head-meta');
-    if (s.directory) meta.appendChild(A.el('span', 'meta-dir', shortDir(s.directory)));
-    if (sessionModelID(s)) meta.appendChild(A.el('span', 'meta-model', s.model.providerID + ' / ' + sessionModelID(s)));
-    var cost = A.fmtCost(s.cost);
-    if (cost) meta.appendChild(A.el('span', 'meta-cost', cost));
-    var updated = A.relTime(s.time && s.time.updated);
-    if (updated) meta.appendChild(A.el('span', 'meta-time', updated));
-    h.appendChild(meta);
-
-    if (st) {
-      var abort = A.el('button', 'btn danger abort', 'Abort');
-      abort.addEventListener('click', function () {
-        A.api('/api/sessions/' + encodeURIComponent(s.id) + '/abort', {
-          method: 'POST', body: { directory: s.directory }
-        }).catch(function () {});
-      });
-      h.appendChild(abort);
-    }
-    if (state.lastError) {
-      h.appendChild(A.el('div', 'msg-error', 'Session error: ' + state.lastError));
-    }
-    return h;
-  }
-
-  function permBanner() {
-    var wrap = A.el('div', 'perm-banners');
-    var all = state.permissions.concat(state.questions.map(function (q) {
-      return { id: q.id, permission: 'question', patterns: q.questions || [], metadata: null, _question: true };
-    }));
-    if (!all.length) return wrap;
-    all.forEach(function (p) {
-      var b = A.el('div', 'perm-banner');
-      b.appendChild(A.el('div', 'perm-head', p._question ? 'Question' : 'Permission request'));
-      var desc = A.el('div', 'perm-desc');
-      var what = (p.permission || '');
-      var pat = (p.patterns && p.patterns.length) ? (' \u2014 ' + p.patterns.join(', ')) : '';
-      var met = (p.metadata && (p.metadata.description || p.metadata.title));
-      desc.textContent = what + pat + (met ? ('\n' + met) : '');
-      b.appendChild(desc);
-      var btns = A.el('div', 'perm-btns');
-      if (p._question) {
-        var rq = A.el('button', 'btn perm-reject', 'Reject');
-        rq.addEventListener('click', function () {
-          A.api('/api/questions/' + encodeURIComponent(p.id) + '/reject', {
-            method: 'POST', body: { directory: state.directory }
-          }).then(function () {
-            state.questions = state.questions.filter(function (x) { return x.id !== p.id; });
-            renderPermBanners();
-          }).catch(function () {});
-        });
-        btns.appendChild(rq);
-      } else {
-        ['once', 'always', 'reject'].forEach(function (r) {
-          var b2 = A.el('button', 'btn perm-' + r, r);
-          b2.addEventListener('click', function () {
-            A.api('/api/permissions/' + encodeURIComponent(p.id) + '/reply', {
-              method: 'POST', body: { directory: state.directory, reply: r }
-            }).then(function () {
-              state.permissions = state.permissions.filter(function (x) { return x.id !== p.id; });
-              renderPermBanners();
-            }).catch(function () {});
-          });
-          btns.appendChild(b2);
-        });
-      }
-      b.appendChild(btns);
-      wrap.appendChild(b);
-    });
-    return wrap;
-  }
-
-  function composerDOM() {
-    var c = A.el('div', 'composer');
-    var form = A.el('form', 'composer-form');
-    form.id = 'composer-form';
-    var row = A.el('div', 'composer-row');
-    var ta = A.el('textarea', 'composer-input');
-    ta.placeholder = 'Send a follow-up message\u2026';
-    ta.setAttribute('rows', '2');
-    row.appendChild(ta);
-    var send = A.el('button', 'btn primary send-btn', 'Send');
-    send.type = 'submit';
-    row.appendChild(send);
-    form.appendChild(row);
-
-    var modelRow = A.el('div', 'composer-model-row');
-    var sel = A.el('select', 'select composer-model');
-    sel.id = 'composer-model';
-    modelRow.appendChild(sel);
-    form.appendChild(modelRow);
-
-    ta.addEventListener('keydown', function (e) {
-      if ((e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.keyCode === 13)) {
-        e.preventDefault();
-        form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
-      }
-    });
-    form.addEventListener('submit', function (e) {
-      e.preventDefault();
-      var text = ta.value.trim();
-      if (!text) return;
-      send.textContent = '\u2026';
-      send.disabled = true;
-      var val = sel.value || '';
-      var slash = val.indexOf('/');
-      var model = { providerID: slash === -1 ? val : val.slice(0, slash), modelID: slash === -1 ? '' : val.slice(slash + 1) };
-      A.api('/api/sessions/' + encodeURIComponent(state.sessionID) + '/prompt', {
-        method: 'POST',
-        body: { directory: state.directory, text: text, model: model }
-      }).then(function () {
-        if (model.modelID) A.saveLastModel(model);
-        ta.value = '';
-        send.textContent = 'Send';
-        send.disabled = false;
-        state.atBottom = true;
-        scrollToBottom(true);
-      }).catch(function (err) {
-        send.textContent = 'Send';
-        send.disabled = false;
-        if (err.message) {
-          var e2 = A.el('div', 'send-error', err.message);
-          form.parentNode.insertBefore(e2, form.nextSibling);
-          setTimeout(function () { e2.remove(); }, 3000);
-        }
-      });
-    });
-    fillComposerModelSelect(sel);
-    c.appendChild(form);
-    return c;
-  }
-
-  function fillComposerModelSelect(sel) {
-    sel.innerHTML = '';
-    var current = sessionModelID(state.session)
-      ? state.session.model.providerID + '/' + sessionModelID(state.session) : null;
-    var last = A.getLastModel ? A.getLastModel() : null;
-    var groups = ['featured', 'more'];
-    groups.forEach(function (gn) {
-      var models = state.models[gn] || [];
-      if (!models.length) return;
-      var og = A.el('optgroup', null);
-      og.label = gn === 'featured' ? 'Featured' : 'More models';
-      models.forEach(function (m) {
-        var o = A.el('option', null);
-        o.value = m.providerID + '/' + m.modelID;
-        o.textContent = m.providerName + ' \u2014 ' + m.modelName + (m.modelID.indexOf(':free') !== -1 ? ' :free' : '');
-        og.appendChild(o);
-      });
-      sel.appendChild(og);
-    });
-    // Keep the session's own model selectable even when the list filters it out
-    // (e.g. a paid OpenRouter model outside the featured set).
-    if (current && !sel.querySelector('option[value="' + current + '"]')) {
-      var own = A.el('option', null, 'This session’s model — ' + current);
-      own.value = current;
-      sel.insertBefore(own, sel.firstChild);
-    }
-    var want = null;
-    if (current && sel.querySelector('option[value="' + current + '"]')) want = current;
-    else if (last && sel.querySelector('option[value="' + last.providerID + '/' + last.modelID + '"]')) {
-      want = last.providerID + '/' + last.modelID;
-    }
-    if (want) sel.value = want;
-  }
-
-  function timelineDOM() {
-    var tl = A.el('div', 'timeline');
+    var tl = el('div', 'timeline');
     tl.id = 'timeline';
-    tl.addEventListener('scroll', onTimelineScroll);
-    if (state.hasOlder) {
-      var older = A.el('button', 'btn load-older', 'Load older messages');
-      older.id = 'load-older';
-      older.addEventListener('click', loadOlder);
-      tl.appendChild(older);
-    }
-    state.messages.forEach(function (m) { tl.appendChild(messageDOM(m)); });
-    return tl;
+    var inner = el('div', 'tl-inner');
+    inner.id = 'tl-inner';
+    inner.appendChild(el('div', 'tl-loading', 'Loading session\u2026'));
+    tl.appendChild(inner);
+    tl.addEventListener('scroll', onScroll, { passive: true });
+    main.appendChild(tl);
+
+    var jump = btn('jump-btn', '', function () { scrollToBottom(true); }, 'down');
+    jump.id = 'jump-btn';
+    jump.setAttribute('aria-label', 'Scroll to latest');
+    jump.hidden = true;
+    main.appendChild(jump);
+
+    main.appendChild(sessionComposer());
+    A.connectEvents(id);
+    fetchSession(true);
   }
 
-  function onTimelineScroll() {
+  function fetchSession(first) {
+    var id = state.sessionID;
+    var q = '/api/sessions/' + encodeURIComponent(id);
+    if (state.directory) q += '?directory=' + encodeURIComponent(state.directory);
+    return A.api(q).then(function (d) {
+      if (state.sessionID !== id) return;
+      state.session = d.session || {};
+      if (!state.directory && state.session.directory) state.directory = state.session.directory;
+      state.messages = sortMessages(d.messages || []);
+      state.hasOlder = state.messages.length >= 200;
+      state.oldestID = state.hasOlder ? state.messages[0].info.id : null;
+      if (d.status && d.status !== 'idle') state.busy[id] = d.status;
+      else if (d.status === 'idle') delete state.busy[id];
+      if (state.pendingPrompt && state.messages.some(function (m) { return m.info.role === 'user'; })) state.pendingPrompt = null;
+      renderHeader();
+      renderTimeline();
+      if (first) {
+        scrollToBottom(true);
+        fetchPending();
+        var sel = document.getElementById('composer-model');
+        if (sel) { sel.dataset.prefer = currentModelKey(); fillModelSelect(sel); }
+      }
+      renderComposerState();
+    }).catch(function (err) {
+      if (state.sessionID !== id) return;
+      var inner = document.getElementById('tl-inner');
+      if (!inner || state.messages.length) return;
+      inner.innerHTML = '';
+      var box = el('div', 'empty-state');
+      box.appendChild(el('div', 'empty-title', 'Could not load this session'));
+      box.appendChild(el('div', 'empty-sub', err.message || ''));
+      var a = el('a', 'btn', 'Start a new session');
+      a.href = '#/new';
+      box.appendChild(a);
+      inner.appendChild(box);
+    });
+  }
+
+  function currentModelKey() {
+    // Prefer the model of the latest assistant message, then the session's.
+    for (var i = state.messages.length - 1; i >= 0; i--) {
+      var inf = state.messages[i].info;
+      if (inf.role === 'assistant' && inf.providerID && inf.modelID) return inf.providerID + '/' + inf.modelID;
+      if (inf.role === 'user' && inf.model && inf.model.providerID) return inf.model.providerID + '/' + inf.model.modelID;
+    }
+    var s = state.session;
+    return sessionModelID(s) ? s.model.providerID + '/' + sessionModelID(s) : '';
+  }
+
+  function sortMessages(arr) {
+    return arr.slice().sort(function (a, b) {
+      var ta = (a.info.time && a.info.time.created) || 0;
+      var tb = (b.info.time && b.info.time.created) || 0;
+      return ta - tb || (a.info.id < b.info.id ? -1 : 1);
+    });
+  }
+
+  function fetchPending() {
+    var dir = state.directory;
+    if (!dir) return;
+    var id = state.sessionID;
+    A.api('/api/permissions?directory=' + encodeURIComponent(dir)).then(function (d) {
+      if (state.sessionID !== id) return;
+      state.permissions = ((d && d.permissions) || []).filter(function (p) { return p.sessionID === id; });
+      renderLive();
+    }).catch(function () {});
+    A.api('/api/questions?directory=' + encodeURIComponent(dir)).then(function (d) {
+      if (state.sessionID !== id) return;
+      state.questions = ((d && d.questions) || []).filter(function (q) { return q.sessionID === id; });
+      renderLive();
+    }).catch(function () {});
+  }
+
+  function deleteSession() {
+    var s = state.session || {};
+    if (!window.confirm('Delete this session? This cannot be undone.')) return;
+    A.api('/api/sessions/' + encodeURIComponent(state.sessionID), {
+      method: 'DELETE', body: { directory: state.directory || s.directory }
+    }).then(function () {
+      var id = state.sessionID;
+      state.sessions = state.sessions.filter(function (x) { return x.id !== id; });
+      renderList();
+      toast('Session deleted');
+      window.location.hash = '#/new';
+    }).catch(function (e) { toast(e.message || 'Delete failed', 'err'); });
+  }
+
+  function renderHeader() {
+    var s = state.session || {};
+    var bar = document.getElementById('session-topbar');
+    if (!bar) return;
+    bar.querySelector('.tb-title').textContent = s.title || s.slug || 'Session';
+    var sub = [shortDir(s.directory || state.directory)];
+    var mk = currentModelKey();
+    if (mk) sub.push(mk.split('/').slice(1).join('/').split('/').pop());
+    var cost = A.fmtCost(s.cost);
+    if (cost) sub.push(cost);
+    bar.querySelector('.tb-sub').textContent = sub.join(' \u00b7 ');
+    var st = sessionStatus(state.sessionID);
+    var badge = document.getElementById('status-badge');
+    badge.className = 'status-badge ' + st;
+    badge.textContent = st === 'running' ? (state.busy[state.sessionID] === 'retry' ? 'Retrying' : 'Running') : st === 'error' ? 'Error' : 'Idle';
+    document.title = (s.title || 'Session') + ' \u2014 opencode remote';
+  }
+
+  // ---------- composer ----------
+  function sessionComposer() {
+    var dock = el('div', 'composer-dock');
+    var form = el('form', 'composer-card');
+    form.id = 'composer-form';
+    var ta = el('textarea', 'composer-input');
+    ta.id = 'composer-input';
+    ta.rows = 1;
+    ta.placeholder = 'Message the agent\u2026';
+    ta.setAttribute('aria-label', 'Message');
+    form.appendChild(ta);
+    var bar = el('div', 'composer-bar');
+    var sel = modelSelect(null);
+    sel.id = 'composer-model';
+    bar.appendChild(sel);
+    bar.appendChild(el('span', 'spacer'));
+    var stop = el('button', 'stop-btn');
+    stop.type = 'button';
+    stop.id = 'stop-btn';
+    stop.hidden = true;
+    stop.setAttribute('aria-label', 'Stop');
+    stop.title = 'Stop the agent';
+    stop.appendChild(icon('stop'));
+    stop.appendChild(el('span', 'btn-label', 'Stop'));
+    stop.addEventListener('click', abortSession);
+    bar.appendChild(stop);
+    var send = el('button', 'send-btn');
+    send.type = 'submit';
+    send.id = 'send-btn';
+    send.setAttribute('aria-label', 'Send');
+    send.appendChild(icon('send'));
+    bar.appendChild(send);
+    form.appendChild(bar);
+    dock.appendChild(form);
+    dock.appendChild(el('div', 'hint dock-hint', 'Enter to send \u00b7 Shift+Enter for a new line'));
+
+    function submit() {
+      var text = ta.value.trim();
+      if (!text || form.dataset.busy) return;
+      var model = selectedModel(sel);
+      if (!model) { toast('Pick a model first', 'err'); return; }
+      form.dataset.busy = '1';
+      send.disabled = true;
+      A.api('/api/sessions/' + encodeURIComponent(state.sessionID) + '/prompt', {
+        method: 'POST', body: { directory: state.directory, text: text, model: model }
+      }).then(function () {
+        A.saveLastModel(model);
+        ta.value = '';
+        autosize(ta);
+        state.busy[state.sessionID] = 'busy';
+        setError(state.sessionID, null);
+        renderHeader();
+        renderComposerState();
+        renderLive();
+        scrollToBottom(true);
+      }).catch(function (e) {
+        toast(e.message || 'Send failed', 'err');
+      }).finally(function () {
+        delete form.dataset.busy;
+        send.disabled = false;
+      });
+    }
+    wireComposer(ta, submit);
+    form.addEventListener('submit', function (e) { e.preventDefault(); submit(); });
+    return dock;
+  }
+
+  function abortSession() {
+    var b = document.getElementById('stop-btn');
+    if (b) b.disabled = true;
+    A.api('/api/sessions/' + encodeURIComponent(state.sessionID) + '/abort', {
+      method: 'POST', body: { directory: state.directory }
+    }).then(function () {
+      toast('Stopping\u2026');
+    }).catch(function (e) {
+      toast(e.message || 'Stop failed', 'err');
+    }).finally(function () { if (b) b.disabled = false; });
+  }
+
+  function renderComposerState() {
+    var running = !!state.busy[state.sessionID];
+    var stop = document.getElementById('stop-btn');
+    if (stop) stop.hidden = !running;
+    var ta = document.getElementById('composer-input');
+    if (ta) ta.placeholder = running ? 'Queue a follow-up\u2026' : 'Message the agent\u2026';
+  }
+
+  // ---------- timeline ----------
+  function onScroll() {
     var tl = document.getElementById('timeline');
     if (!tl) return;
-    state.atBottom = (tl.scrollHeight - tl.scrollTop - tl.clientHeight) < 120;
-  }
-
-  function loadOlder() {
-    if (state.loadingMoreOlder || !state.oldersBefore) return;
-    state.loadingMoreOlder = true;
-    var q = '/api/sessions/' + encodeURIComponent(state.sessionID) +
-      '?directory=' + encodeURIComponent(state.directory) +
-      '&before=' + encodeURIComponent(state.oldersBefore) + '&limit=200';
-    A.api(q).then(function (d) {
-      state.loadingMoreOlder = false;
-      var oldMsgs = d.messages || [];
-      var keep = 0;
-      var tl = document.getElementById('timeline');
-      if (tl) keep = tl.scrollHeight;
-      state.messages = oldMsgs.concat(state.messages);
-      state.oldersBefore = oldMsgs.length ? oldestMessageID(oldMsgs) : null;
-      state.hasOlder = oldMsgs.length >= 200;
-      renderSession();
-      var tl2 = document.getElementById('timeline');
-      if (tl2) tl2.scrollTop = tl2.scrollHeight - keep;
-    }).catch(function () {
-      state.loadingMoreOlder = false;
-    });
-  }
-
-  function messageDOM(m) {
-    var info = m.info || {};
-    var wrap = A.el('div', 'msg msg-' + info.role);
-    var body = A.el('div', 'msg-body');
-    var parts = m.parts || [];
-    if (info.error) {
-      var e = A.el('div', 'msg-error', String(info.error));
-      body.appendChild(e);
-    }
-    parts.forEach(function (p) { body.appendChild(partDOM(p)); });
-    if (!parts.length) body.appendChild(A.el('div', 'msg-empty', '(empty message)'));
-    wrap.appendChild(body);
-    var foot = A.el('div', 'msg-foot');
-    if (info.modelID) foot.appendChild(A.el('span', 'msg-model', String(info.modelID).split('/').pop()));
-    var cost = A.fmtCost(info.cost);
-    if (cost) foot.appendChild(A.el('span', 'msg-cost', cost));
-    var created = A.relTime(info.time && info.time.created);
-    if (created) foot.appendChild(A.el('span', 'msg-time', created));
-    if (foot.childNodes.length) wrap.appendChild(foot);
-    return wrap;
-  }
-
-  function partDOM(p) {
-    switch (p.type) {
-      case 'text': return textPart(p);
-      case 'reasoning': return reasoningPart(p);
-      case 'tool': return toolPart(p);
-      case 'patch': return patchPart(p);
-      case 'step-finish': return stepFinishPart(p);
-      case 'file': return filePart(p);
-      case 'agent': return labelPart('agent', p.title || p.agent || p.modelID || 'agent');
-      case 'subtask': return labelPart('subtask', p.title || 'subtask');
-      case 'compaction': return labelPart('compaction', p.summary || 'compaction');
-      case 'step-start': return A.el('div', 'part-step', '');
-      default: return unknownPart(p);
-    }
-  }
-
-  function textPart(p) {
-    var d = A.el('div', 'part part-text');
-    var inner = A.el('div', 'md');
-    inner.innerHTML = window.Markdown.render(p.text || '');
-    d.appendChild(inner);
-    return d;
-  }
-
-  function reasoningPart(p) {
-    var d = A.el('div', 'part part-reasoning');
-    var btn = A.el('button', 'reasoning-toggle', '\u25b8 reasoning');
-    var body = A.el('div', 'reasoning-body md');
-    body.innerHTML = window.Markdown.render(p.text || '');
-    body.hidden = true;
-    btn.addEventListener('click', function () {
-      body.hidden = !body.hidden;
-      btn.textContent = body.hidden ? '\u25b8 reasoning' : '\u25be reasoning';
-    });
-    d.appendChild(btn);
-    d.appendChild(body);
-    return d;
-  }
-
-  function toolPart(p) {
-    var st = p.state || {};
-    var d = A.el('div', 'part part-tool');
-    var head = A.el('div', 'tool-head');
-    head.appendChild(A.el('span', 'tool-name', p.tool || 'tool'));
-    var status = st.status || 'unknown';
-    head.appendChild(A.el('span', 'tool-status ' + status, status));
-    if (st.title) head.appendChild(A.el('span', 'tool-title', String(st.title)));
-    if (st.error) head.appendChild(A.el('span', 'tool-error', String(st.error)));
-    d.appendChild(head);
-    if (st.input !== undefined || st.output !== undefined) {
-      var details = A.el('details', 'tool-details');
-      details.appendChild(A.el('summary', null, 'details'));
-      if (st.input !== undefined) {
-        var pre = A.el('pre', 'tool-pre');
-        pre.textContent = typeof st.input === 'string' ? st.input : JSON.stringify(st.input, null, 2);
-        details.appendChild(pre);
-      }
-      if (st.output !== undefined) {
-        var pre2 = A.el('pre', 'tool-pre');
-        pre2.textContent = st.output;
-        details.appendChild(pre2);
-      }
-      d.appendChild(details);
-    }
-    return d;
-  }
-
-  function patchPart(p) {
-    var d = A.el('div', 'part part-patch');
-    var files = (p.files || []).slice(0, 4);
-    d.appendChild(A.el('div', 'patch-head', 'patch \u00b7 ' + files.length + ' file' + (files.length === 1 ? '' : 's')));
-    files.forEach(function (f) {
-      d.appendChild(A.el('div', 'patch-file', f));
-    });
-    return d;
-  }
-
-  function stepFinishPart(p) {
-    var d = A.el('div', 'part part-step-finish');
-    var parts = [];
-    if (p.reason) parts.push(p.reason);
-    var cost = A.fmtCost(p.cost);
-    if (cost) parts.push(cost);
-    d.textContent = parts.join(' \u00b7 ');
-    return d;
-  }
-
-  function filePart(p) {
-    var d = A.el('div', 'part part-file');
-    d.textContent = p.path || p.file || 'file';
-    return d;
-  }
-
-  function labelPart(kind, label) {
-    var d = A.el('div', 'part part-' + kind);
-    d.textContent = label || kind;
-    return d;
-  }
-
-  function unknownPart(p) {
-    var d = A.el('div', 'part part-unknown');
-    d.textContent = 'unknown part: ' + (p.type || '');
-    return d;
+    state.atBottom = (tl.scrollHeight - tl.scrollTop - tl.clientHeight) < 80;
+    var j = document.getElementById('jump-btn');
+    if (j) j.hidden = state.atBottom;
   }
 
   function scrollToBottom(force) {
     var tl = document.getElementById('timeline');
     if (!tl) return;
-    if (force || state.atBottom) tl.scrollTop = tl.scrollHeight;
-  }
-
-  function fetchPermissions() {
-    if (!state.directory) { state.permissions = []; return; }
-    A.api('/api/permissions?directory=' + encodeURIComponent(state.directory)).then(function (d) {
-      state.permissions = d && d.permissions ? d.permissions : (Array.isArray(d) ? d : []);
-      renderPermBanners();
-    }).catch(function () {});
-  }
-
-  // ---------- event handling ----------
-  function handleEvent(ev) {
-    // The backend forwards a flat {type, properties} envelope (lib/events.js);
-    // accept the raw upstream {payload:{type, properties}} shape too.
-    var payload = (ev && ev.payload) || ev || {};
-    var props = payload.properties || {};
-    var type = payload.type;
-    var sID = props.sessionID ||
-      (props.info && props.info.sessionID) ||
-      (props.part && props.part.sessionID) ||
-      null;
-    var inSession = state.sessionID && sID === state.sessionID;
-
-    if (inSession) {
-      if (type === 'message.updated') upsertMessageInfo(props.info);
-      else if (type === 'message.part.updated') upsertPart(props.part);
-      else if (type === 'message.part.delta') applyDelta(props);
-      else if (type === 'message.part.removed') removePart(props.partID, props.messageID);
-      else if (type === 'message.removed') removeMessage(props.messageID);
-      else if (type === 'session.status') onSessionStatus(props.status);
-      else if (type === 'session.idle') {
-        delete state.busySet[state.sessionID];
-        renderHeader();
-        fetchSession();
-      } else if (type === 'session.updated' && props.info) {
-        state.session = Object.assign({}, state.session, props.info);
-        renderHeader();
-      } else if (type === 'session.error') {
-        state.lastError = props.error;
-        renderHeader();
-      } else if (type === 'permission.asked') {
-        state.permissions.push({ id: props.id, sessionID: props.sessionID, permission: props.permission, patterns: props.patterns, metadata: props.metadata });
-        renderPermBanners();
-      } else if (type === 'permission.replied') {
-        state.permissions = state.permissions.filter(function (x) { return x.id !== props.requestID; });
-        renderPermBanners();
-      } else if (type === 'question.asked') {
-        state.questions.push({ id: props.id, sessionID: props.sessionID, questions: props.questions });
-        renderPermBanners();
-      }
-    }
-
-    // List view events
-    if (type === 'session.updated' && props.info) {
-      upsertListSession(props.info);
-    } else if (type === 'session.status' && props.sessionID) {
-      var st = props.status ? props.status.type : 'idle';
-      if (st === 'idle') delete state.busySet[props.sessionID];
-      else state.busySet[props.sessionID] = st;
-      renderListItems();
-    } else if (type === 'session.idle' && props.sessionID) {
-      delete state.busySet[props.sessionID];
-      renderListItems();
-    } else if (type === 'session.created' && props.info) {
-      if (!state.sessions.some(function (s) { return s.id === props.info.id; })) {
-        state.sessions.unshift(props.info);
-        renderListItems();
-      }
-    } else if (type === 'session.deleted' && props.sessionID) {
-      state.sessions = state.sessions.filter(function (s) { return s.id !== props.sessionID; });
-      renderListItems();
+    if (force || state.atBottom) {
+      tl.scrollTop = tl.scrollHeight;
+      state.atBottom = true;
+      var j = document.getElementById('jump-btn');
+      if (j) j.hidden = true;
     }
   }
 
-  function upsertListSession(info) {
-    if (!info || !info.id) return;
-    var found = state.sessions.some(function (s) { return s.id === info.id; });
-    if (found) {
-      state.sessions = state.sessions.map(function (s) {
-        return s.id === info.id ? Object.assign({}, s, info) : s;
+  function renderTimeline() {
+    var inner = document.getElementById('tl-inner');
+    if (!inner) return;
+    var tl = document.getElementById('timeline');
+    var wasBottom = state.atBottom;
+    var keep = tl.scrollTop;
+    inner.innerHTML = '';
+    msgEls = {};
+    partEls = {};
+    if (state.hasOlder) {
+      var older = btn('btn ghost small load-older', 'Load earlier messages', loadOlder);
+      inner.appendChild(older);
+    }
+    var visible = 0;
+    state.messages.forEach(function (m) {
+      var n = messageDOM(m);
+      inner.appendChild(n);
+      visible++;
+    });
+    if (!visible && !state.pendingPrompt && !state.busy[state.sessionID]) {
+      var e = el('div', 'empty-state');
+      e.appendChild(el('div', 'empty-title', 'No messages yet'));
+      e.appendChild(el('div', 'empty-sub', 'Send a message below to start.'));
+      inner.appendChild(e);
+    }
+    var live = el('div', 'tl-live');
+    live.id = 'tl-live';
+    inner.appendChild(live);
+    renderLive();
+    if (wasBottom) scrollToBottom(true);
+    else tl.scrollTop = keep;
+  }
+
+  function loadOlder() {
+    if (state.loadingOlder || !state.oldestID) return;
+    state.loadingOlder = true;
+    var id = state.sessionID;
+    var q = '/api/sessions/' + encodeURIComponent(id) + '?directory=' + encodeURIComponent(state.directory) +
+      '&before=' + encodeURIComponent(state.oldestID) + '&limit=200';
+    A.api(q).then(function (d) {
+      state.loadingOlder = false;
+      if (state.sessionID !== id) return;
+      var older = sortMessages(d.messages || []);
+      var tl = document.getElementById('timeline');
+      var fromBottom = tl.scrollHeight - tl.scrollTop;
+      state.messages = older.concat(state.messages);
+      state.hasOlder = older.length >= 200;
+      state.oldestID = state.hasOlder ? older[0].info.id : null;
+      state.atBottom = false;
+      renderTimeline();
+      tl.scrollTop = tl.scrollHeight - fromBottom;
+    }).catch(function () { state.loadingOlder = false; });
+  }
+
+  function messageDOM(m) {
+    var info = m.info || {};
+    var role = info.role === 'user' ? 'user' : 'assistant';
+    // Intermediate steps (the model stopped to call tools) read as one answer.
+    var wrap = el('div', 'msg ' + role + (info.finish === 'tool-calls' ? ' step' : ''));
+    wrap.dataset.id = info.id;
+    var body = el('div', role === 'user' ? 'bubble' : 'msg-body');
+    wrap.appendChild(body);
+    (m.parts || []).forEach(function (p) {
+      var n = partDOM(p, role);
+      if (n) { partEls[p.id] = n; body.appendChild(n); }
+    });
+    if (info.error) wrap.appendChild(errorDOM(info.error));
+    wrap.appendChild(msgFoot(m));
+    msgEls[info.id] = wrap;
+    return wrap;
+  }
+
+  function msgFoot(m) {
+    var info = m.info || {};
+    var foot = el('div', 'msg-foot');
+    if (info.role === 'assistant') {
+      if (info.modelID) foot.appendChild(el('span', 'mf-model', String(info.modelID).split('/').pop()));
+      var cost = A.fmtCost(info.cost);
+      if (cost) foot.appendChild(el('span', null, cost));
+      if (info.time && info.time.completed && info.time.created) {
+        foot.appendChild(el('span', null, fmtDur(info.time.completed - info.time.created)));
+      }
+    }
+    var t = info.time && info.time.created;
+    if (t) {
+      var ts = el('span', 'mf-time', A.relTime(t));
+      ts.title = new Date(t).toLocaleString();
+      foot.appendChild(ts);
+    }
+    var hasText = (m.parts || []).some(function (p) { return p.type === 'text' && p.text && !p.synthetic; });
+    if (hasText) {
+      var c = btn('mini-btn', 'Copy', null, 'copy');
+      c.addEventListener('click', function () {
+        var txt = (m.parts || []).filter(function (p) { return p.type === 'text' && !p.synthetic; })
+          .map(function (p) { return p.text; }).join('\n\n');
+        copyText(txt, c);
       });
-    } else {
-      state.sessions.unshift(info);
+      foot.appendChild(c);
     }
-    renderListItems();
+    return foot;
+  }
+
+  function refreshFoot(m) {
+    var w = msgEls[m.info.id];
+    if (!w) return;
+    var old = w.querySelector(':scope > .msg-foot');
+    var nf = msgFoot(m);
+    if (old) w.replaceChild(nf, old); else w.appendChild(nf);
+    var oldErr = w.querySelector(':scope > .err-card');
+    if (oldErr) oldErr.remove();
+    var oldStop = w.querySelector(':scope > .stopped-note');
+    if (oldStop) oldStop.remove();
+    if (m.info.error) w.insertBefore(errorDOM(m.info.error), nf);
+    w.classList.toggle('step', m.info.finish === 'tool-calls');
+  }
+
+  function fmtDur(ms) {
+    if (!(ms > 0)) return '';
+    if (ms < 1000) return ms + 'ms';
+    var s = ms / 1000;
+    if (s < 60) return s.toFixed(s < 10 ? 1 : 0) + 's';
+    return Math.floor(s / 60) + 'm ' + Math.round(s % 60) + 's';
+  }
+
+  function errorDOM(e) {
+    if (isAbort(e)) return el('div', 'stopped-note', 'Stopped');
+    return errorCard(errText(e));
+  }
+
+  function errorCard(text) {
+    var c = el('div', 'err-card');
+    c.appendChild(icon('alert'));
+    c.appendChild(el('div', 'err-text', text));
+    return c;
+  }
+
+  // ---------- parts ----------
+  function partDOM(p, role) {
+    if (role === 'user') {
+      if (p.type === 'text') {
+        if (p.synthetic) return null;
+        return el('div', 'part user-text', p.text || '');
+      }
+      if (p.type === 'file') return fileChip(p);
+      return null;
+    }
+    switch (p.type) {
+      case 'text': return textPart(p);
+      case 'reasoning': return reasoningPart(p);
+      case 'tool': return toolPart(p);
+      case 'patch': return patchPart(p);
+      case 'file': return fileChip(p);
+      case 'agent': return labelPart('Agent: ' + (p.name || p.agent || ''));
+      case 'subtask': return labelPart('Subtask: ' + (p.description || p.prompt || '').slice(0, 120));
+      case 'compaction': return labelPart('Conversation compacted');
+      case 'retry': return labelPart('Retrying' + (p.attempt ? ' (attempt ' + p.attempt + ')' : ''));
+      case 'step-start':
+      case 'step-finish':
+      case 'snapshot':
+        return null;
+      default: return null;
+    }
+  }
+
+  function textPart(p) {
+    var d = el('div', 'part md');
+    d.innerHTML = window.Markdown.render(p.text || '');
+    return d;
+  }
+
+  function reasoningPart(p) {
+    var running = !(p.time && p.time.end);
+    var d = el('details', 'part fold thinking' + (running ? ' running' : ''));
+    d.open = !!state.openParts[p.id];
+    d.addEventListener('toggle', function () { state.openParts[p.id] = d.open; });
+    var sum = el('summary');
+    sum.appendChild(icon('chevron', 'chev'));
+    sum.appendChild(el('span', 'fold-name', running ? 'Thinking\u2026' : 'Thought'));
+    if (!running && p.time && p.time.start) sum.appendChild(el('span', 'fold-dim', fmtDur(p.time.end - p.time.start)));
+    d.appendChild(sum);
+    var b = el('div', 'fold-body md');
+    b.innerHTML = window.Markdown.render(p.text || '');
+    d.appendChild(b);
+    return d;
+  }
+
+  var TOOL_ICONS = {
+    bash: 'terminal', read: 'file', write: 'edit', edit: 'edit', patch: 'edit', apply_patch: 'edit', multiedit: 'edit',
+    grep: 'search', glob: 'search', list: 'folder', ls: 'folder', webfetch: 'globe', websearch: 'globe',
+    todowrite: 'list', todoread: 'list', task: 'bot', question: 'help'
+  };
+
+  function relPath(p) {
+    if (!p) return '';
+    var d = state.directory || '';
+    if (d && p.indexOf(d + '/') === 0) return p.slice(d.length + 1);
+    return shortDir(p);
+  }
+
+  function toolSummary(p) {
+    var st = p.state || {};
+    var inp = st.input || {};
+    switch (p.tool) {
+      case 'bash': return String(inp.command || st.title || '').split('\n')[0];
+      case 'read': case 'write': case 'edit': case 'multiedit': return relPath(inp.filePath || inp.path || '') || st.title || '';
+      case 'grep': return (inp.pattern || '') + (inp.path ? '  in ' + relPath(inp.path) : '');
+      case 'glob': return inp.pattern || '';
+      case 'list': case 'ls': return relPath(inp.path || '') || '.';
+      case 'webfetch': return inp.url || '';
+      case 'task': return inp.description || st.title || '';
+      case 'todowrite': return Array.isArray(inp.todos) ? inp.todos.length + ' items' : '';
+      default: return st.title || '';
+    }
+  }
+
+  function toolPart(p) {
+    var st = p.state || {};
+    var status = st.status || 'pending';
+    var d = el('details', 'part fold tool st-' + status);
+    d.open = !!state.openParts[p.id];
+    d.addEventListener('toggle', function () {
+      state.openParts[p.id] = d.open;
+      if (d.open && !d.dataset.filled) fillTool(d, p);
+    });
+    var sum = el('summary');
+    sum.appendChild(icon('chevron', 'chev'));
+    sum.appendChild(icon(TOOL_ICONS[p.tool] || 'tool', 'tool-ic'));
+    sum.appendChild(el('span', 'fold-name', p.tool || 'tool'));
+    sum.appendChild(el('span', 'fold-arg', toolSummary(p)));
+    var md = st.metadata || {};
+    var fd = md.filediff;
+    if (fd && (fd.additions || fd.deletions)) {
+      var stat = el('span', 'diffstat');
+      stat.appendChild(el('span', 'add', '+' + (fd.additions || 0)));
+      stat.appendChild(el('span', 'del', '\u2212' + (fd.deletions || 0)));
+      sum.appendChild(stat);
+    }
+    var tail = el('span', 'fold-status');
+    if (status === 'running' || status === 'pending') tail.appendChild(el('span', 'spinner'));
+    else if (status === 'completed') {
+      tail.appendChild(icon('check', 'ok'));
+      if (st.time && st.time.end) tail.appendChild(el('span', 'fold-dim', fmtDur(st.time.end - st.time.start)));
+    } else if (status === 'error') tail.appendChild(icon('alert', 'bad'));
+    sum.appendChild(tail);
+    d.appendChild(sum);
+    if (d.open) fillTool(d, p);
+    return d;
+  }
+
+  // Tool bodies are built lazily on first expand: outputs can be large.
+  function fillTool(d, p) {
+    d.dataset.filled = '1';
+    var st = p.state || {};
+    var md = st.metadata || {};
+    var inp = st.input || {};
+    var body = el('div', 'fold-body tool-body');
+    if (st.status === 'error' && st.error) body.appendChild(errorCard(String(st.error)));
+    var diff = typeof md.diff === 'string' && md.diff ? md.diff : null;
+    if (diff) {
+      var dv = el('div', 'diff-view');
+      dv.innerHTML = window.Markdown.renderDiff(clip(diff, 60000));
+      body.appendChild(dv);
+    } else if (p.tool === 'bash') {
+      body.appendChild(preBlock('$ ' + (inp.command || ''), 'cmd'));
+      var outText = typeof md.output === 'string' ? md.output : st.output;
+      if (outText) body.appendChild(preBlock(clip(String(outText), 30000)));
+    } else if (p.tool === 'todowrite' && Array.isArray(inp.todos)) {
+      var ul = el('ul', 'todo-list');
+      inp.todos.forEach(function (t) {
+        var li = el('li', 'todo ' + (t.status || ''), t.content || '');
+        ul.appendChild(li);
+      });
+      body.appendChild(ul);
+    } else if (p.tool === 'write' && typeof inp.content === 'string') {
+      body.appendChild(preBlock(clip(inp.content, 30000)));
+    } else if (p.tool === 'read' && st.output) {
+      body.appendChild(preBlock(clip(String(st.output), 30000)));
+    } else {
+      if (inp && Object.keys(inp).length) body.appendChild(preBlock(clip(JSON.stringify(inp, null, 2), 20000), 'input'));
+      if (st.output) body.appendChild(preBlock(clip(String(st.output), 30000)));
+    }
+    if (!body.childNodes.length) body.appendChild(el('div', 'fold-dim', st.status === 'running' ? 'Running\u2026' : 'No output'));
+    var old = d.querySelector('.tool-body');
+    if (old) old.remove();
+    d.appendChild(body);
+  }
+
+  function clip(s, n) { return s.length > n ? s.slice(0, n) + '\n\u2026 (' + (s.length - n) + ' more characters)' : s; }
+
+  function preBlock(text, cls) {
+    var wrap = el('div', 'codeblock' + (cls ? ' ' + cls : ''));
+    var pre = el('pre', 'code');
+    pre.textContent = text;
+    var cb = btn('copy-btn floating', 'Copy');
+    cb.addEventListener('click', function () { copyText(text.replace(/^\$ /, ''), cb); });
+    wrap.appendChild(cb);
+    wrap.appendChild(pre);
+    return wrap;
+  }
+
+  function patchPart(p) {
+    var files = p.files || [];
+    var d = el('details', 'part fold patch');
+    d.open = !!state.openParts[p.id];
+    d.addEventListener('toggle', function () { state.openParts[p.id] = d.open; });
+    var sum = el('summary');
+    sum.appendChild(icon('chevron', 'chev'));
+    sum.appendChild(icon('edit', 'tool-ic'));
+    sum.appendChild(el('span', 'fold-name', 'Changed ' + files.length + ' file' + (files.length === 1 ? '' : 's')));
+    d.appendChild(sum);
+    var b = el('div', 'fold-body');
+    files.forEach(function (f) { b.appendChild(el('div', 'patch-file mono', relPath(f))); });
+    d.appendChild(b);
+    return d;
+  }
+
+  function fileChip(p) {
+    var c = el('div', 'part file-chip');
+    c.appendChild(icon('file'));
+    c.appendChild(el('span', null, p.filename || relPath(p.url && p.url.replace(/^file:\/\//, '')) || 'file'));
+    return c;
+  }
+
+  function labelPart(text) { return el('div', 'part label-part', text); }
+
+  // ---------- live area: permissions, questions, working indicator ----------
+  function renderLive() {
+    var live = document.getElementById('tl-live');
+    if (!live) return;
+    live.innerHTML = '';
+    if (state.pendingPrompt && state.pendingPrompt.sessionID === state.sessionID &&
+        !state.messages.some(function (m) { return m.info.role === 'user'; })) {
+      var u = el('div', 'msg user pending');
+      var bub = el('div', 'bubble');
+      bub.appendChild(el('div', 'part user-text', state.pendingPrompt.text));
+      u.appendChild(bub);
+      live.appendChild(u);
+    }
+    state.permissions.forEach(function (p) { live.appendChild(permissionCard(p)); });
+    state.questions.forEach(function (q) { live.appendChild(questionCard(q)); });
+    var running = !!state.busy[state.sessionID];
+    if (running && !state.permissions.length && !state.questions.length) {
+      var w = el('div', 'working');
+      var dots = el('span', 'dots');
+      dots.appendChild(el('i'));
+      dots.appendChild(el('i'));
+      dots.appendChild(el('i'));
+      w.appendChild(dots);
+      w.appendChild(el('span', null, state.busy[state.sessionID] === 'retry' ? 'Retrying\u2026' : 'Working\u2026'));
+      live.appendChild(w);
+    }
+    if (!running && state.errors[state.sessionID]) {
+      live.appendChild(errorCard('Last run failed: ' + state.errors[state.sessionID]));
+    }
+    scrollToBottom(false);
+  }
+
+  function permissionCard(p) {
+    var c = el('div', 'card perm-card');
+    var h = el('div', 'card-head');
+    h.appendChild(icon('alert'));
+    h.appendChild(el('span', null, 'Permission needed'));
+    c.appendChild(h);
+    var md = p.metadata || {};
+    var what = el('div', 'card-body');
+    what.appendChild(el('span', 'perm-kind', p.permission || 'action'));
+    var desc = md.description || md.title || (p.permission === 'bash' && md.command) || '';
+    if (desc) what.appendChild(el('div', 'perm-desc', String(desc)));
+    var pats = (p.patterns || []).filter(Boolean);
+    if (pats.length) {
+      var pre = el('pre', 'code perm-pat');
+      pre.textContent = pats.join('\n');
+      what.appendChild(pre);
+    }
+    c.appendChild(what);
+    var acts = el('div', 'card-actions');
+    function reply(r) {
+      acts.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+      A.api('/api/permissions/' + encodeURIComponent(p.id) + '/reply', {
+        method: 'POST', body: { directory: state.directory, reply: r }
+      }).then(function () {
+        state.permissions = state.permissions.filter(function (x) { return x.id !== p.id; });
+        renderLive();
+      }).catch(function (e) {
+        toast(e.message || 'Reply failed', 'err');
+        acts.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+      });
+    }
+    acts.appendChild(btn('btn primary', 'Allow once', function () { reply('once'); }));
+    acts.appendChild(btn('btn', 'Always allow', function () { reply('always'); }));
+    acts.appendChild(btn('btn danger', 'Deny', function () { reply('reject'); }));
+    c.appendChild(acts);
+    return c;
+  }
+
+  function questionCard(q) {
+    var c = el('div', 'card question-card');
+    var h = el('div', 'card-head');
+    h.appendChild(icon('help'));
+    h.appendChild(el('span', null, 'The agent has a question'));
+    c.appendChild(h);
+    var picks = [];
+    var customs = [];
+    (q.questions || []).forEach(function (qi, idx) {
+      picks[idx] = [];
+      var blk = el('div', 'card-body q-block');
+      if (qi.header) blk.appendChild(el('div', 'q-header', qi.header));
+      blk.appendChild(el('div', 'q-text', qi.question || ''));
+      var opts = el('div', 'q-opts');
+      (qi.options || []).forEach(function (o) {
+        var ob = btn('q-opt', o.label, function () {
+          var i = picks[idx].indexOf(o.label);
+          if (qi.multiple) {
+            if (i === -1) picks[idx].push(o.label); else picks[idx].splice(i, 1);
+          } else {
+            picks[idx] = i === -1 ? [o.label] : [];
+          }
+          opts.querySelectorAll('.q-opt').forEach(function (x) {
+            x.classList.toggle('on', picks[idx].indexOf(x.dataset.label) !== -1);
+          });
+        });
+        ob.dataset.label = o.label;
+        if (o.description) ob.title = o.description;
+        if (o.description) ob.appendChild(el('span', 'q-desc', o.description));
+        opts.appendChild(ob);
+      });
+      blk.appendChild(opts);
+      if (qi.custom !== false) {
+        var ci = el('input', 'text-input q-custom');
+        ci.placeholder = 'Or type your own answer';
+        customs[idx] = ci;
+        blk.appendChild(ci);
+      }
+      c.appendChild(blk);
+    });
+    var acts = el('div', 'card-actions');
+    function done() {
+      state.questions = state.questions.filter(function (x) { return x.id !== q.id; });
+      renderLive();
+    }
+    acts.appendChild(btn('btn primary', 'Send answer', function () {
+      var answers = picks.map(function (p, i) {
+        var a = p.slice();
+        var cv = customs[i] && customs[i].value.trim();
+        if (cv) a.push(cv);
+        return a;
+      });
+      A.api('/api/questions/' + encodeURIComponent(q.id) + '/reply', {
+        method: 'POST', body: { directory: state.directory, answers: answers }
+      }).then(done).catch(function (e) { toast(e.message || 'Reply failed', 'err'); });
+    }));
+    acts.appendChild(btn('btn', 'Dismiss', function () {
+      A.api('/api/questions/' + encodeURIComponent(q.id) + '/reject', {
+        method: 'POST', body: { directory: state.directory }
+      }).then(done).catch(function (e) { toast(e.message || 'Dismiss failed', 'err'); });
+    }));
+    c.appendChild(acts);
+    return c;
+  }
+
+  // ---------- incremental updates ----------
+  function findMessage(id) {
+    for (var i = 0; i < state.messages.length; i++) if (state.messages[i].info.id === id) return state.messages[i];
+    return null;
   }
 
   function upsertMessageInfo(info) {
     if (!info || !info.id) return;
-    var found = false;
-    state.messages.forEach(function (m) {
-      if (m.info.id === info.id) { m.info = Object.assign({}, m.info, info); found = true; }
-    });
-    if (!found) {
-      state.messages.push({ info: info, parts: [] });
-      state.messages.sort(function (a, b) { return (a.info.time.created || 0) - (b.info.time.created || 0); });
+    var m = findMessage(info.id);
+    if (m) {
+      m.info = Object.assign({}, m.info, info);
+      refreshFoot(m);
+      if (info.role === 'assistant' && info.error && !isAbort(info.error)) setError(state.sessionID, errText(info.error));
+      return;
     }
-    updateTimeline();
+    m = { info: info, parts: [] };
+    state.messages.push(m);
+    if (info.role === 'user' && state.pendingPrompt) state.pendingPrompt = null;
+    var last = state.messages.length > 1 ? state.messages[state.messages.length - 2] : null;
+    var inOrder = !last || ((last.info.time && last.info.time.created) || 0) <= ((info.time && info.time.created) || 0);
+    if (!inOrder) {
+      state.messages = sortMessages(state.messages);
+      renderTimeline();
+      return;
+    }
+    var inner = document.getElementById('tl-inner');
+    var live = document.getElementById('tl-live');
+    if (!inner || !live) return;
+    var empty = inner.querySelector('.empty-state');
+    if (empty) empty.remove();
+    inner.insertBefore(messageDOM(m), live);
+    renderLive();
+    scrollToBottom(false);
   }
 
   function upsertPart(part) {
     if (!part || !part.messageID) return;
-    var msg = findMessage(part.messageID);
-    if (!msg) return;
-    var found = false;
-    msg.parts.forEach(function (p) {
-      if (p.id === part.id) { Object.assign(p, part); found = true; }
-    });
-    if (!found) msg.parts.push(part);
-    updateTimeline();
+    var m = findMessage(part.messageID);
+    if (!m) return;
+    var existing = null;
+    for (var i = 0; i < m.parts.length; i++) if (m.parts[i].id === part.id) existing = m.parts[i];
+    if (existing) Object.assign(existing, part);
+    else m.parts.push(part);
+    queuePart(part.id);
   }
 
   function applyDelta(props) {
-    var msg = findMessage(props.messageID);
-    if (!msg) return;
-    msg.parts.forEach(function (p) {
-      if (p.id === props.partID && props.field) {
-        if (!p[props.field]) p[props.field] = '';
-        p[props.field] += props.delta || '';
-      }
-    });
-    updateTimeline();
+    var m = findMessage(props.messageID);
+    if (!m || !props.field) return;
+    var p = null;
+    for (var i = 0; i < m.parts.length; i++) if (m.parts[i].id === props.partID) p = m.parts[i];
+    if (!p) return;
+    p[props.field] = (p[props.field] || '') + (props.delta || '');
+    queuePart(p.id);
   }
 
   function removePart(partID, messageID) {
-    var msg = findMessage(messageID);
-    if (!msg) return;
-    msg.parts = msg.parts.filter(function (p) { return p.id !== partID; });
-    updateTimeline();
+    var m = findMessage(messageID);
+    if (!m) return;
+    m.parts = m.parts.filter(function (p) { return p.id !== partID; });
+    if (partEls[partID]) { partEls[partID].remove(); delete partEls[partID]; }
   }
 
   function removeMessage(messageID) {
     state.messages = state.messages.filter(function (m) { return m.info.id !== messageID; });
-    updateTimeline();
+    if (msgEls[messageID]) { msgEls[messageID].remove(); delete msgEls[messageID]; }
   }
 
-  function findMessage(id) {
-    var found = null;
-    state.messages.forEach(function (m) { if (m.info.id === id) found = m; });
-    return found;
+  // Coalesce bursts of deltas into one DOM update per part per animation frame.
+  function queuePart(id) {
+    pending[id] = true;
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(flushParts);
   }
 
-  function updateTimeline() {
-    var tl = document.getElementById('timeline');
-    if (!tl) return;
-    var nearBottom = state.atBottom;
-    var keep = tl.scrollTop;
-    renderMessagesOnly();
-    tl.scrollTop = keep;
-    if (nearBottom) scrollToBottom(true);
+  function flushParts() {
+    rafPending = false;
+    var ids = Object.keys(pending);
+    pending = {};
+    var wasBottom = state.atBottom;
+    ids.forEach(function (id) {
+      var found = null, msg = null;
+      state.messages.forEach(function (m) {
+        m.parts.forEach(function (p) { if (p.id === id) { found = p; msg = m; } });
+      });
+      if (!found) return;
+      var role = msg.info.role === 'user' ? 'user' : 'assistant';
+      var n = partDOM(found, role);
+      var old = partEls[id];
+      if (old && old.parentNode) {
+        if (n) old.parentNode.replaceChild(n, old); else old.remove();
+      } else if (n) {
+        var w = msgEls[msg.info.id];
+        if (!w) return;
+        var body = w.querySelector(role === 'user' ? '.bubble' : '.msg-body');
+        body.appendChild(n);
+      }
+      if (n) partEls[id] = n; else delete partEls[id];
+      var w2 = msgEls[msg.info.id];
+      if (w2 && !w2.querySelector(':scope > .msg-foot .mini-btn') && found.type === 'text') refreshFoot(msg);
+    });
+    if (wasBottom) scrollToBottom(true);
   }
 
-  function renderMessagesOnly() {
-    var tl = document.getElementById('timeline');
-    if (!tl) return;
-    var keep = tl.scrollTop;
-    tl.innerHTML = '';
-    if (state.hasOlder) {
-      var older = A.el('button', 'btn load-older', 'Load older messages');
-      older.id = 'load-older';
-      older.addEventListener('click', loadOlder);
-      tl.appendChild(older);
+  // ---------- events ----------
+  function handleEvent(ev) {
+    var payload = (ev && ev.payload) || ev || {};
+    var props = payload.properties || {};
+    var type = payload.type;
+    var sID = props.sessionID || (props.info && props.info.sessionID) || (props.part && props.part.sessionID) || null;
+    var listID = type && type.indexOf('session.') === 0 ? (props.info ? props.info.id : props.sessionID) : null;
+
+    // sidebar
+    if (type === 'session.updated' || type === 'session.created') {
+      upsertListSession(props.info);
+    } else if (type === 'session.deleted') {
+      var did = props.info ? props.info.id : props.sessionID;
+      state.sessions = state.sessions.filter(function (s) { return s.id !== did; });
+      scheduleListRender();
+    } else if (type === 'session.status' && listID) {
+      var stt = props.status ? props.status.type : 'idle';
+      if (stt === 'idle') delete state.busy[listID];
+      else { state.busy[listID] = stt; setError(listID, null); }
+      scheduleListRender();
+    } else if (type === 'session.idle' && listID) {
+      delete state.busy[listID];
+      scheduleListRender();
+    } else if (type === 'session.error' && props.sessionID && !isAbort(props.error)) {
+      setError(props.sessionID, errText(props.error) || 'error');
+      scheduleListRender();
     }
-    state.messages.forEach(function (m) { tl.appendChild(messageDOM(m)); });
-    tl.scrollTop = keep;
+
+    // open session
+    var inSession = state.sessionID && (sID === state.sessionID || listID === state.sessionID);
+    if (!inSession) return;
+    switch (type) {
+      case 'message.updated': upsertMessageInfo(props.info); break;
+      case 'message.part.updated': upsertPart(props.part); break;
+      case 'message.part.delta': applyDelta(props); break;
+      case 'message.part.removed': removePart(props.partID, props.messageID); break;
+      case 'message.removed': removeMessage(props.messageID); break;
+      case 'session.updated':
+        if (props.info && props.info.id === state.sessionID) { state.session = Object.assign({}, state.session, props.info); renderHeader(); }
+        break;
+      case 'session.status':
+      case 'session.idle':
+        renderHeader();
+        renderComposerState();
+        renderLive();
+        if (!state.busy[state.sessionID]) settle();
+        break;
+      case 'session.error':
+        renderHeader();
+        renderLive();
+        break;
+      case 'permission.asked':
+        if (!state.permissions.some(function (x) { return x.id === props.id; })) state.permissions.push(props);
+        renderLive();
+        break;
+      case 'permission.replied':
+        state.permissions = state.permissions.filter(function (x) { return x.id !== (props.requestID || props.permissionID); });
+        renderLive();
+        break;
+      case 'question.asked':
+        if (!state.questions.some(function (x) { return x.id === props.id; })) state.questions.push(props);
+        renderLive();
+        break;
+      case 'question.replied':
+      case 'question.rejected':
+        state.questions = state.questions.filter(function (x) { return x.id !== props.requestID; });
+        renderLive();
+        break;
+    }
   }
 
-  function renderHeader() {
-    var view = document.getElementById('session-view');
-    if (!view) return;
-    var oldH = view.querySelector('.session-header');
-    if (oldH) oldH.remove();
-    view.insertBefore(headerDOM(), view.firstChild);
-  }
-
-  function renderPermBanners() {
-    var view = document.getElementById('session-view');
-    if (!view) return;
-    var old = view.querySelector('.perm-banners');
-    if (old) old.remove();
-    var nb = permBanner();
-    var header = view.querySelector('.session-header');
-    if (header && header.nextSibling) header.parentNode.insertBefore(nb, header.nextSibling);
-    else view.insertBefore(nb, view.firstChild);
-  }
-
-  function onSessionStatus(statusObj) {
-    var st = statusObj ? statusObj.type : 'idle';
-    if (st === 'idle') { delete state.busySet[state.sessionID]; fetchSession(); }
-    else { state.busySet[state.sessionID] = st; renderHeader(); }
+  // After a run ends, reload once so the transcript matches the server exactly
+  // (final costs, titles, parts that arrived while the stream reconnected).
+  var settleTimer = null;
+  function settle() {
+    clearTimeout(settleTimer);
+    settleTimer = setTimeout(function () { if (state.sessionID) fetchSession(false); }, 400);
   }
 
   function onConnect() {
-    if (state.sessionID) fetchSession();
+    if (state.hadDisconnect) {
+      state.hadDisconnect = false;
+      if (state.sessionID) { fetchSession(false); fetchPending(); }
+      fetchList(false);
+    }
   }
-  function onReconnect() {
-    if (state.sessionID) fetchSession();
-  }
+  function onReconnect() { state.hadDisconnect = true; }
 
   // ---------- navigation ----------
   function nav() {
@@ -1077,10 +1705,11 @@
       if (eq === -1) params[decodeURIComponent(kv)] = '';
       else params[decodeURIComponent(kv.slice(0, eq))] = decodeURIComponent(kv.slice(eq + 1));
     });
-    if (parts.length === 0) { listView(); return; }
-    if (parts[0] === 'new') { newView(); return; }
-    if (parts[0] === 's' && parts[1]) { sessionView(parts[1], params.d || '', params); return; }
-    listView();
+    closeDrawer();
+    closeModal();
+    document.title = 'opencode remote';
+    if (parts[0] === 's' && parts[1]) { sessionView(decodeURIComponent(parts[1]), params.d || ''); return; }
+    newView();
   }
 
   window.Views = {

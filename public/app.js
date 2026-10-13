@@ -47,9 +47,11 @@
         if (pw.classList.contains('masked')) {
           pw.classList.remove('masked');
           reveal.setAttribute('aria-pressed', 'true');
+          reveal.textContent = 'Hide';
         } else {
           pw.classList.add('masked');
           reveal.setAttribute('aria-pressed', 'false');
+          reveal.textContent = 'Show';
         }
         pw.focus();
       });
@@ -115,6 +117,7 @@
     var d = new Date(ts);
     if (isNaN(d.getTime())) return '';
     var diff = Date.now() - d.getTime();
+    if (diff < 0) diff = 0;
     if (diff < 60000) return 'just now';
     if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
     if (diff < 0) return 'soon';

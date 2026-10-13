@@ -22,9 +22,12 @@
   // on special characters so we don't re-process the tags we generate.
   function renderInline(escaped) {
     let s = escaped;
-    // code spans: `...` (content escaped already, so just wrap)
+    // code spans: `...` (content escaped already). Park them behind placeholders
+    // so the emphasis/link rules below never touch their content.
+    var codes = [];
     s = s.replace(/`([^`]+)`/g, function (m, code) {
-      return '<code>' + code + '</code>';
+      codes.push('<code>' + code + '</code>');
+      return '\u0000' + (codes.length - 1) + '\u0000';
     });
     // bold **...**
     s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
@@ -44,7 +47,38 @@
     s = s.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, function (m, pre, url) {
       return pre + '<a href="' + attr(url) + '" rel="noreferrer noopener" target="_blank">' + url + '</a>';
     });
-    return s;
+    return s.replace(/\u0000(\d+)\u0000/g, function (m, n) { return codes[Number(n)]; });
+  }
+
+  function splitRow(row) {
+    return row.replace(/^\|/, '').replace(/\|$/, '').split('|').map(function (c) { return c.trim(); });
+  }
+
+  // Escaped diff lines -> one span per line, coloured by its first character.
+  function diffLines(lines) {
+    return lines.map(function (l) {
+      var cls = 'dl';
+      if (/^(\+\+\+|---|diff |index |Index: |={3,})/.test(l)) cls = 'dl dl-meta';
+      else if (l[0] === '+') cls = 'dl dl-add';
+      else if (l[0] === '-') cls = 'dl dl-del';
+      else if (l.slice(0, 2) === '@@') cls = 'dl dl-hunk';
+      return '<span class="' + cls + '">' + (l || ' ') + '</span>';
+    }).join('');
+  }
+
+  // A fenced block with a header (language + copy button; the click handler is
+  // delegated in views.js because the CSP forbids inline handlers).
+  function codeBlock(buf, lang) {
+    var isDiff = lang === 'diff' || lang === 'patch';
+    var body = isDiff ? diffLines(buf) : buf.join('\n');
+    return '<div class="codeblock"><div class="cb-head"><span class="cb-lang">' + attr(lang || 'text') +
+      '</span><button type="button" class="copy-btn" data-copy="code">Copy</button></div>' +
+      '<pre class="code' + (isDiff ? ' diff' : '') + '"><code>' + body + '</code></pre></div>';
+  }
+
+  // Render raw (unescaped) diff text, e.g. from an edit tool's metadata.
+  function renderDiff(text) {
+    return '<pre class="code diff"><code>' + diffLines(escapeHtml(String(text || '')).replace(/\r\n/g, '\n').split('\n')) + '</code></pre>';
   }
 
   function render(text) {
@@ -57,6 +91,7 @@
     var listStack = []; // 'ul' | 'ol'
     var inFence = null;
     var fenceBuf = [];
+    var fenceLang = '';
 
     function closeListsTo(level) {
       while (listStack.length > level) {
@@ -75,13 +110,13 @@
         if (inFence === null) {
           inFence = true;
           fenceBuf = [];
+          fenceLang = fence[2].trim().split(/\s+/)[0] || '';
           closeAllLists();
-          out.push('<pre class="code"><code class="lang-' + attr(fence[2].trim()) + '">');
           i++;
           continue;
         } else {
           inFence = null;
-          out.push('\n' + fenceBuf.join('\n') + '</code></pre>');
+          out.push(codeBlock(fenceBuf, fenceLang));
           fenceBuf = [];
           i++;
           continue;
@@ -156,6 +191,25 @@
         continue;
       }
 
+      // table: | a | b | followed by a |---|---| separator row
+      if (/^\|.*\|$/.test(trimmed) && i + 1 < lines.length && /^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$/.test(lines[i + 1].trim())) {
+        closeAllLists();
+        var head = splitRow(trimmed);
+        var rows = [];
+        i += 2;
+        while (i < lines.length && /^\|.*\|$/.test(lines[i].trim())) {
+          rows.push(splitRow(lines[i].trim()));
+          i++;
+        }
+        var t = '<div class="table-wrap"><table><thead><tr>' +
+          head.map(function (c) { return '<th>' + renderInline(c) + '</th>'; }).join('') + '</tr></thead><tbody>';
+        rows.forEach(function (r) {
+          t += '<tr>' + r.map(function (c) { return '<td>' + renderInline(c) + '</td>'; }).join('') + '</tr>';
+        });
+        out.push(t + '</tbody></table></div>');
+        continue;
+      }
+
       // paragraph: gather consecutive non-blank, non-special lines
       closeAllLists();
       var para = [line];
@@ -163,7 +217,7 @@
       while (i < lines.length) {
         var nxt = lines[i];
         if (!nxt.trim() || /^(```|~~~)/.test(nxt.trim()) ||
-            /^(#{1,6}\s|[-*+]\s|\d+[.)]\s|&gt;)/.test(nxt.trim())) {
+            /^(#{1,6}\s|[-*+]\s|\d+[.)]\s|&gt;|\|)/.test(nxt.trim())) {
           break;
         }
         para.push(nxt);
@@ -172,11 +226,11 @@
       out.push('<p>' + renderInline(para.join('\n')) + '</p>');
     }
     if (inFence) {
-      out.push('\n' + fenceBuf.join('\n') + '</code></pre>');
+      out.push(codeBlock(fenceBuf, fenceLang));
     }
     closeAllLists();
     return out.join('\n');
   }
 
-  window.Markdown = { render: render };
+  window.Markdown = { render: render, renderDiff: renderDiff, escape: escapeHtml };
 })();

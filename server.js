@@ -26,6 +26,11 @@ const OPENCODE_USERNAME = process.env.OPENCODE_USERNAME || 'opencode';
 const OPENCODE_PASSWORD = process.env.OPENCODE_PASSWORD || '';
 const DEFAULT_DIRECTORY = process.env.DEFAULT_DIRECTORY || '/home/flori/Dev';
 const ALLOWED_DIR_PREFIX = process.env.ALLOWED_DIR_PREFIX || '/home/flori/';
+// Where a new session runs when the Directory field is left empty.
+const NEW_SESSION_DIRECTORY = process.env.NEW_SESSION_DIRECTORY || '/home/flori/Dev/temp';
+// Automated health probes create a session every few minutes under /tmp; they
+// drown out real work in the session list unless hidden.
+const PROBE_DIR_PREFIX = '/tmp/';
 
 if (!APP_PASSWORD) {
   console.error('APP_PASSWORD is required');
@@ -224,7 +229,7 @@ function serveStatic(res, urlPath) {
 }
 
 function isStaticPublicUrl(p) {
-  return p === '/login.html' || p === '/styles.css' || p === '/login.css' || p === '/login.js' || p === '/app.js' || p === '/markdown.js' || p === '/favicon.svg' || p === '/favicon.ico';
+  return p === '/login.html' || p === '/styles.css' || p === '/theme.js' || p === '/login.css' || p === '/login.js' || p === '/app.js' || p === '/markdown.js' || p === '/favicon.svg' || p === '/favicon.ico';
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +335,11 @@ async function handleApi(req, res, url, method) {
       return await apiStatus(res);
     }
 
+    // ---- config (non-secret UI defaults) ----
+    if (pathname === '/api/config' && method === 'GET') {
+      return json(res, 200, { newSessionDirectory: NEW_SESSION_DIRECTORY, allowedPrefix: ALLOWED_DIR_PREFIX });
+    }
+
     // ---- models ----
     if (pathname === '/api/models' && method === 'GET') {
       return await apiModels(res);
@@ -351,6 +361,10 @@ async function handleApi(req, res, url, method) {
       const sub = sessionMatch[2];
       if (!isValidSessionId(id)) return sendError(res, 400, 'invalid session id');
       if (!sub && method === 'GET') return await apiSessionGet(res, id, url);
+      if (!sub && method === 'DELETE') {
+        const body = await parseJsonBody(req);
+        return await apiSessionDelete(res, id, body);
+      }
       if (method === 'POST') {
         const body = await parseJsonBody(req);
         const action = sub || body.action;
@@ -377,14 +391,26 @@ async function handleApi(req, res, url, method) {
     }
 
     // ---- questions ----
-    const questionMatch = pathname.match(/^\/api\/questions\/([^/]+)\/reject$/);
+    if (pathname === '/api/questions' && method === 'GET') {
+      const v = validateExistingDirectory(url.searchParams.get('directory') || DEFAULT_DIRECTORY);
+      if (!v.ok) return sendError(res, 400, v.error);
+      const data = await upstream.json('/question' + qp({ directory: v.dir }));
+      return json(res, 200, { questions: Array.isArray(data) ? data : [] });
+    }
+    const questionMatch = pathname.match(/^\/api\/questions\/([^/]+)\/(reject|reply)$/);
     if (questionMatch && method === 'POST') {
       const qid = decodeURIComponent(questionMatch[1]);
       if (!isValidPermissionId(qid)) return sendError(res, 400, 'invalid question id');
       const body = await parseJsonBody(req);
       const v = validateExistingDirectory(body.directory || DEFAULT_DIRECTORY);
       if (!v.ok) return sendError(res, 400, v.error);
-      await upstream.fetch('/question/' + qid + '/reject' + qp({ directory: v.dir }), { method: 'POST' });
+      if (questionMatch[2] === 'reject') {
+        await upstream.fetch('/question/' + qid + '/reject' + qp({ directory: v.dir }), { method: 'POST' });
+        return noContent(res);
+      }
+      const answers = sanitizeAnswers(body.answers);
+      if (!answers) return sendError(res, 400, 'invalid answers');
+      await upstream.json('/question/' + qid + '/reply' + qp({ directory: v.dir }), { body: { answers } });
       return noContent(res);
     }
 
@@ -462,18 +488,72 @@ async function apiSessionsList(res, url) {
   let limit = 50;
   if (limitRaw && /^\d+$/.test(limitRaw)) limit = Math.min(Number(limitRaw), 200);
 
-  const params = { roots: 'true', limit: String(limit) };
-  if (search) params.search = search;
-  if (cursor) params.cursor = cursor;
+  const hideProbes = url.searchParams.get('hideProbes') === '1';
+  if (cursor && !/^\d+$/.test(cursor)) return sendError(res, 400, 'invalid cursor');
 
-  const sessions = await upstream.json('/experimental/session' + qp(params));
-  if (!Array.isArray(sessions)) return sendError(res, 502, 'bad upstream data');
+  // With probes hidden, scan bigger upstream pages until `limit` real sessions
+  // are found (probes can outnumber real sessions 10:1).
+  const pageSize = hideProbes ? 500 : limit;
+  const out = [];
+  let upCursor = cursor || null;
+  let exhausted = false;
+  for (let page = 0; page < (hideProbes ? 6 : 1) && out.length < limit; page++) {
+    const params = { roots: 'true', limit: String(pageSize) };
+    if (search) params.search = search;
+    if (upCursor) params.cursor = upCursor;
+    const sessions = await upstream.json('/experimental/session' + qp(params));
+    if (!Array.isArray(sessions)) return sendError(res, 502, 'bad upstream data');
+    for (const s of sessions) {
+      if (out.length >= limit) break;
+      if (hideProbes && isProbeSession(s)) continue;
+      out.push(s);
+    }
+    if (sessions.length < pageSize) { exhausted = true; break; }
+    upCursor = sessions[sessions.length - 1].time?.updated ?? null;
+    if (!upCursor) { exhausted = true; break; }
+  }
 
   // Merge busy status where cheap (distinct directories, max 10 parallel).
-  const sessionsJson = await mergeStatus(sessions);
-  // A short page means there is nothing older to fetch.
-  const nextCursor = sessions.length >= limit ? (sessions[sessions.length - 1].time?.updated ?? null) : null;
-  return json(res, 200, { sessions: sessionsJson, cursor: nextCursor });
+  const sessionsJson = await mergeStatus(out);
+  let nextCursor = null;
+  if (out.length >= limit) nextCursor = out[out.length - 1].time?.updated ?? null;
+  else if (!exhausted && upCursor) nextCursor = upCursor;
+  return json(res, 200, { sessions: sessionsJson.map(listSession), cursor: nextCursor });
+}
+
+function isProbeSession(s) {
+  return !!(s && typeof s.directory === 'string' && s.directory.startsWith(PROBE_DIR_PREFIX));
+}
+
+// The list only needs a few fields; upstream sessions also carry permission
+// rule sets and token counters that would bloat the payload.
+function listSession(s) {
+  return {
+    id: s.id,
+    title: s.title,
+    slug: s.slug,
+    directory: s.directory,
+    model: s.model ? { id: s.model.id, providerID: s.model.providerID } : undefined,
+    cost: s.cost,
+    time: s.time,
+    summary: s.summary,
+    busy: s.busy,
+  };
+}
+
+function sanitizeAnswers(answers) {
+  if (!Array.isArray(answers) || answers.length > 20) return null;
+  const out = [];
+  for (const a of answers) {
+    if (!Array.isArray(a) || a.length > 20) return null;
+    const row = [];
+    for (const x of a) {
+      if (typeof x !== 'string' || x.length > 4000) return null;
+      row.push(x);
+    }
+    out.push(row);
+  }
+  return out;
 }
 
 async function mergeStatus(sessions) {
@@ -516,11 +596,13 @@ async function apiSessionGet(res, id, url) {
   const limitRaw = url.searchParams.get('limit');
   const limit = limitRaw && /^\d+$/.test(limitRaw) ? String(Math.min(Number(limitRaw), 500)) : '200';
 
-  const [session, messages] = await Promise.all([
+  const [session, messages, statuses] = await Promise.all([
     upstream.json('/session/' + id + qp({ directory: v.dir })),
     upstream.json('/session/' + id + '/message' + qp({ directory: v.dir, limit, before })),
+    before ? null : upstream.json('/session/status' + qp({ directory: v.dir })).catch(() => null),
   ]);
-  return json(res, 200, { session, messages });
+  const st = statuses && typeof statuses === 'object' ? statuses[id] : null;
+  return json(res, 200, { session, messages, status: st && st.type ? st.type : 'idle' });
 }
 
 // ---------------------------------------------------------------------------
@@ -538,12 +620,13 @@ async function apiCreateSession(res, body) {
     return sendError(res, 400, 'model required');
   }
 
-  const v = validateDirectory(rawDir, ALLOWED_DIR_PREFIX);
+  const useDefault = typeof rawDir !== 'string' || rawDir.trim() === '';
+  const v = validateDirectory(useDefault ? NEW_SESSION_DIRECTORY : rawDir.trim(), ALLOWED_DIR_PREFIX);
   if (!v.ok) return sendError(res, 400, v.error);
 
   const dir = v.dir;
 
-  if (createDirectory) {
+  if ((createDirectory || useDefault) && !(await directoryExists(dir))) {
     // 1) create a helper session in ALLOWED_DIR_PREFIX
     let helper;
     try {
@@ -585,6 +668,23 @@ async function apiCreateSession(res, body) {
   });
 
   return json(res, 200, { session });
+}
+
+// Upstream lists an existing directory with 200 and answers 500 for a missing one.
+async function directoryExists(dir) {
+  try {
+    await upstream.json(FS_LIST_ENDPOINT + qp({ path: '.', directory: dir }));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function apiSessionDelete(res, id, body) {
+  const v = validateExistingDirectory(body.directory || DEFAULT_DIRECTORY);
+  if (!v.ok) return sendError(res, 400, v.error);
+  await upstream.fetch('/session/' + id + qp({ directory: v.dir }), { method: 'DELETE' });
+  return noContent(res);
 }
 
 // ---------------------------------------------------------------------------

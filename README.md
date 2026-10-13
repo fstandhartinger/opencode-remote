@@ -25,7 +25,19 @@ browser ──HTTPS──> Traefik ──> opencode-remote container (this repo,
 - `lib/events.js` — one upstream `/global/event` SSE connection, whitelisted event
   types fanned out to browsers, filtered per session.
 - `lib/validate.js` — directory and ID validation.
-- `public/` — vanilla JS SPA (`app.js`, `views.js`, `markdown.js`, `styles.css`).
+- `public/` — vanilla JS SPA (`app.js`, `views.js`, `markdown.js`, `styles.css`, `theme.js`).
+
+## UI
+
+Chat-style layout (sidebar with session history + main pane), modelled on the Chutes chat app:
+- sidebar: sessions grouped by day with live status (running / idle / error), search,
+  automated `/tmp` probe sessions hidden by default; an off-canvas drawer on phones
+- new session: one screen with the first prompt, model picker and working directory
+  (empty = `NEW_SESSION_DIRECTORY`, recent-directory chips, folder browser)
+- transcript: incremental streaming render, markdown with copyable code blocks and tables,
+  collapsible tool calls (diffs for edits, command + output for bash), collapsible reasoning
+- inline permission and question cards; sticky composer (Enter sends, Shift+Enter newline)
+  with a Stop button while the agent runs; delete session; dark/light theme
 
 ## Environment
 
@@ -35,7 +47,8 @@ browser ──HTTPS──> Traefik ──> opencode-remote container (this repo,
 | `SESSION_SECRET` | cookie HMAC key (required; rotate to log everyone out) |
 | `OPENCODE_URL` | `http://172.30.1.1:4096` in production |
 | `OPENCODE_USERNAME` / `OPENCODE_PASSWORD` | basic auth for opencode serve |
-| `DEFAULT_DIRECTORY` | default `/home/flori/Dev` |
+| `DEFAULT_DIRECTORY` | fallback directory for permission/question calls, default `/home/flori/Dev` |
+| `NEW_SESSION_DIRECTORY` | where a new session runs when Directory is left empty, default `/home/flori/Dev/temp` (created on demand) |
 | `ALLOWED_DIR_PREFIX` | new sessions only under this prefix, default `/home/flori/` |
 | `PORT` | default 8080 |
 
